@@ -1,8 +1,9 @@
 """
 app.py
 ------
-FastAPI microservice hosting both passport entry stamp extraction and
-visa stamp/sticker extraction on standard CPU using Qwen2-VL-2B-Instruct.
+FastAPI microservice hosting passport entry stamp extraction,
+visa stamp/sticker extraction, and visual bio-data extraction (non-MRZ)
+on standard CPU using Qwen2-VL-2B-Instruct.
 """
 
 import io
@@ -21,29 +22,38 @@ from qwen_vl_utils import process_vision_info
 from config import settings
 from schemas.stamp import StampExtractionResponse
 from schemas.visa import VisaExtractionResponse
+from schemas.passport_bio import PassportBioExtractionResponse
 
 # ==============================================================================
 # Model Lifespan Management
 # ==============================================================================
 
+# Dictionary holding in-memory references to the shared processor and model
 ml_state = {}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     Loads Qwen2-VL-2B-Instruct once into CPU memory upon server boot.
-    Shared across both visa and stamp extraction endpoints.
+    Shared across visa, stamp, and passport bio extraction endpoints to avoid memory churn.
     """
-    print(f"[*] Loading model '{settings.model_id}' onto {settings.device.upper()}...")
-    
-    # Processor handles visual patch tokenization with bounded dimensions for CPU speed
+    print(f"[*] Initializing model '{settings.model_id}' on device: {settings.device.upper()}...")
+
+    # Set PyTorch thread limit to avoid CPU core contention on standard multi-core servers
+    # Adjust or leave default based on server hardware threads
+    if torch.get_num_threads() > 4:
+        torch.set_num_threads(4)
+
+    # AutoProcessor tokenizes image patches and text prompts
+    # min_pixels and max_pixels bound visual token resolution for optimal CPU latency
     processor = AutoProcessor.from_pretrained(
         settings.model_id,
         min_pixels=256 * 28 * 28,
         max_pixels=1024 * 28 * 28
     )
 
-    # Load 32-bit float model weights for standard CPU execution
+    # Load 32-bit float weights for deterministic execution on standard CPU hardware
     model = Qwen2VLForConditionalGeneration.from_pretrained(
         settings.model_id,
         torch_dtype=torch.float32,
@@ -51,15 +61,16 @@ async def lifespan(app: FastAPI):
         low_cpu_mem_usage=True
     )
 
+    # Store references in global lifespan dictionary
     ml_state["processor"] = processor
     ml_state["model"] = model
-    print("[*] Model and processor successfully loaded into memory.")
+    print("[*] Model and processor successfully loaded and ready for queries.")
 
     yield
 
-    # Clean up upon server termination
+    # Release memory handles when the FastAPI application shuts down
     ml_state.clear()
-    print("[*] Released model resources from memory.")
+    print("[*] Model resources freed from memory.")
 
 
 # ==============================================================================
@@ -67,9 +78,9 @@ async def lifespan(app: FastAPI):
 # ==============================================================================
 
 app = FastAPI(
-    title="Passport Stamp & Visa Capture API",
-    description="Local open-source CPU service for passport entry stamps and visa pages.",
-    version="1.1.0",
+    title="Passport Stamp, Visa & Bio-Data Capture API",
+    description="Local open-source CPU service for passport entry stamps, visa pages, and visual bio-data.",
+    version="1.2.0",
     lifespan=lifespan
 )
 
@@ -80,16 +91,25 @@ app = FastAPI(
 
 def prepare_uploaded_image(upload_file: UploadFile) -> Image.Image:
     """
-    Validates uploaded file, standardizes channels to RGB, and scales down
-    oversized captures to maintain low inference latency on standard CPU.
+    Reads incoming multipart binary bytes, confirms image legitimacy, standardizes
+    color channels to RGB, and scales down oversized images to maintain responsive CPU latency.
     """
+    # Verify content type starts with image/
+    if upload_file.content_type and not upload_file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported file MIME type: {upload_file.content_type}. Please upload an image."
+        )
+
     try:
         raw_bytes = upload_file.file.read()
         image = Image.open(io.BytesIO(raw_bytes))
 
+        # Standardize color profile to 3-channel RGB (removes alpha channel or CMYK artifacts)
         if image.mode != "RGB":
             image = image.convert("RGB")
 
+        # Downscale proportionally if largest dimension exceeds config bounds
         max_dim = settings.max_image_dimension
         if max(image.size) > max_dim:
             image.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
@@ -98,7 +118,7 @@ def prepare_uploaded_image(upload_file: UploadFile) -> Image.Image:
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unable to process image: {str(exc)}"
+            detail=f"Failed to decode and prepare uploaded image: {str(exc)}"
         )
 
 
@@ -107,16 +127,17 @@ def execute_vlm_query(image: Image.Image, system_prompt: str) -> dict:
     Executes a structured query against the shared in-memory Qwen2-VL model
     and parses the output into a Python dictionary.
     """
+    # Fetch active model instances from lifespan storage
     processor = ml_state.get("processor")
     model = ml_state.get("model")
 
     if not model or not processor:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Model is not initialized."
+            detail="Vision model engine is not ready or has not been initialized."
         )
 
-    # Format chat conversation for Qwen2-VL
+    # Format user prompt according to Qwen2-VL chat conversation template
     messages = [
         {
             "role": "user",
@@ -127,9 +148,11 @@ def execute_vlm_query(image: Image.Image, system_prompt: str) -> dict:
         }
     ]
 
+    # Process prompt template and extract visual input tensors
     text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
-    
+
+    # Build input tensor dictionaries
     inputs = processor(
         text=[text_prompt],
         images=image_inputs,
@@ -138,41 +161,44 @@ def execute_vlm_query(image: Image.Image, system_prompt: str) -> dict:
         return_tensors="pt"
     )
 
-    # Run deterministic inference on CPU
+    # Run deterministic inference without calculating gradients
     with torch.no_grad():
         generated_ids = model.generate(
             **inputs,
-            max_new_tokens=256,
+            max_new_tokens=320,
             do_sample=False
         )
 
-    # Slice off prompt tokens
+    # Separate model-generated response tokens from the input prompt tokens
     generated_ids_trimmed = [
         out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
     ]
+
+    # Decode tokens into UTF-8 string
     raw_text = processor.batch_decode(
         generated_ids_trimmed,
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False
     )[0]
 
-    # Extract JSON payload from model response
+    # Extract JSON string payload bounded by brackets
     try:
         match = re.search(r"\{.*\}", raw_text, re.DOTALL)
         if match:
             return json.loads(match.group(0))
         return json.loads(raw_text)
     except Exception:
-        return {"confidence_note": f"Raw output: {raw_text}"}
+        return {"confidence_note": f"Raw model response: {raw_text}"}
 
 
 # ==============================================================================
 # Service Endpoints
 # ==============================================================================
 
-# Dynamic paths derived from config settings
+# Dynamic route paths from central settings
 full_stamp_path = f"{settings.api_v1_prefix}{settings.stamp_extract_path}"
 full_visa_path = f"{settings.api_v1_prefix}{settings.visa_extract_path}"
+full_bio_path = f"{settings.api_v1_prefix}{settings.passport_bio_extract_path}"
 
 
 @app.post(
@@ -275,6 +301,73 @@ async def extract_visa_data(
     )
 
 
+@app.post(
+    full_bio_path,
+    response_model=PassportBioExtractionResponse,
+    summary="Extract Passport Bio-Data from Visual Page (Non-MRZ Fallback)",
+    tags=["Immigration Extraction"]
+)
+async def extract_passport_bio_data(
+    file: UploadFile = File(..., description="Passport biodata identity page image (works even if MRZ is cut off or missing)")
+):
+    """
+    Extracts guest identity information directly from the Visual Inspection Zone (VIZ)
+    of a passport page when the bottom MRZ lines are obscured, cropped, or illegible.
+    Maps directly to Form-C Field 1 (Name) and Field 3 (Nationality)[cite: 7, 8].
+    """
+    # Preprocess image dimensions and color profile
+    image = prepare_uploaded_image(file)
+
+    # Prompt designed to extract visual label-value pairs without requiring OCR-B MRZ text
+    prompt = (
+        "You are an expert document analyzer specializing in international passport bio-data pages.\n"
+        "Analyze the passport page image using ONLY visual text fields (even if the bottom MRZ line is cropped, blurry, or missing).\n"
+        "Extract the following details accurately:\n"
+        "1. Passport Number (Document Number, often in top-right or body).\n"
+        "2. Surname / Family Name.\n"
+        "3. Given Names / First and Middle Names.\n"
+        "4. Combine Surname and Given Names formatted as 'SURNAME, GIVEN NAMES'.\n"
+        "5. Nationality (Country name or 3-letter code).\n"
+        "6. Date of Birth, Date of Issue, and Date of Expiry (normalize all dates to YYYY-MM-DD).\n"
+        "7. Sex / Gender ('M', 'F', or 'X').\n"
+        "8. Place of Birth (City / Country).\n"
+        "Return ONLY a valid JSON object matching this schema:\n"
+        "{\n"
+        '  "is_passport_detected": true,\n'
+        '  "passport_number": "string or null",\n'
+        '  "surname": "string or null",\n'
+        '  "given_names": "string or null",\n'
+        '  "full_name": "string or null",\n'
+        '  "nationality": "string or null",\n'
+        '  "date_of_birth": "YYYY-MM-DD or null",\n'
+        '  "sex": "string or null",\n'
+        '  "place_of_birth": "string or null",\n'
+        '  "date_of_issue": "YYYY-MM-DD or null",\n'
+        '  "date_of_expiry": "YYYY-MM-DD or null",\n'
+        '  "confidence_note": "string or null"\n'
+        "}\n"
+        "Do not include any conversational text or markdown codeblocks outside the JSON."
+    )
+
+    data = execute_vlm_query(image, prompt)
+
+    # Construct and return validated Pydantic model
+    return PassportBioExtractionResponse(
+        is_passport_detected=data.get("is_passport_detected", False),
+        passport_number=data.get("passport_number"),
+        surname=data.get("surname"),
+        given_names=data.get("given_names"),
+        full_name=data.get("full_name") or f"{data.get('surname', '')} {data.get('given_names', '')}".strip() or None,
+        nationality=data.get("nationality"),
+        date_of_birth=data.get("date_of_birth"),
+        sex=data.get("sex"),
+        place_of_birth=data.get("place_of_birth"),
+        date_of_issue=data.get("date_of_issue"),
+        date_of_expiry=data.get("date_of_expiry"),
+        confidence_note=data.get("confidence_note")
+    )
+
+
 @app.get("/health", tags=["System"])
 def health():
     """Health check endpoint indicating active endpoints and runtime parameters."""
@@ -286,7 +379,8 @@ def health():
         "configured_port": settings.app_port,
         "endpoints": {
             "stamp_extraction": full_stamp_path,
-            "visa_extraction": full_visa_path
+            "visa_extraction": full_visa_path,
+            "passport_bio_extraction": full_bio_path
         }
     }
 

@@ -9,6 +9,7 @@ routes, and model IDs can be changed easily between local development and Ubuntu
 import os
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
 class Settings(BaseSettings):
     """
     Central settings model for network binding, route endpoints, and VLM parameters.
@@ -21,6 +22,7 @@ class Settings(BaseSettings):
     api_v1_prefix: str = "/api/v1"
     stamp_extract_path: str = "/extract/stamp"
     visa_extract_path: str = "/extract/visa"
+    passport_bio_extract_path: str = "/extract/passport-bio"
 
     # Vision Language Model parameters
     model_id: str = "Qwen/Qwen2-VL-2B-Instruct"
@@ -34,5 +36,6 @@ class Settings(BaseSettings):
         extra="ignore"
     )
 
-# Global singleton instance
+
+# Global singleton instance loaded once across the entire application runtime
 settings = Settings()
