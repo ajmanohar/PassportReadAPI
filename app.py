@@ -1,153 +1,101 @@
+"""
+app.py
+------
+Main application service for passport immigration stamp capture.
+Reads host, port, and route paths dynamically from config.py.
+Executes Qwen2-VL locally on standard CPU.
+"""
+
 import io
 import json
 import re
-from typing import Optional
 from contextlib import asynccontextmanager
 
+import uvicorn
 from fastapi import FastAPI, File, UploadFile, HTTPException, status
-from pydantic import BaseModel, Field
 from PIL import Image
 import torch
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
-# ==============================================================================
-# 1. Pydantic Models for Output Validation
-# ==============================================================================
-
-class VisaExtractionResponse(BaseModel):
-    """
-    Structured data model for visa page extraction.
-    Matches standard Form-C fields (Field 4: Place of issue of visa, Visa number).
-    """
-    is_visa_detected: bool = Field(
-        default=False, 
-        description="True if a visa sticker or consular stamp is present on the page"
-    )
-    visa_number: Optional[str] = Field(
-        default=None, 
-        description="Extracted visa number (printed or handwritten)"
-    )
-    place_of_issue: Optional[str] = Field(
-        default=None, 
-        description="City or mission where the visa was issued"
-    )
-    date_of_issue: Optional[str] = Field(
-        default=None, 
-        description="Date of visa issue in YYYY-MM-DD format"
-    )
-    date_of_expiry: Optional[str] = Field(
-        default=None, 
-        description="Date of visa expiry in YYYY-MM-DD format"
-    )
-    visa_type: Optional[str] = Field(
-        default=None, 
-        description="Type of visa (e.g., Tourist, Business, Entry, e-Visa)"
-    )
-    handwritten_notes: Optional[str] = Field(
-        default=None, 
-        description="Any manual officer remarks, endorsements, or pen notes"
-    )
-
-
-class StampExtractionResponse(BaseModel):
-    """
-    Structured data model for arrival / landing stamp extraction.
-    Matches Form-C Field 5 (Date of Arrival in India) and Field 12 (Port/City arrived).
-    """
-    is_stamp_detected: bool = Field(
-        default=False, 
-        description="True if an immigration ink stamp is detected"
-    )
-    arrival_date: Optional[str] = Field(
-        default=None, 
-        description="Arrival or landing date normalized to YYYY-MM-DD"
-    )
-    port_of_entry: Optional[str] = Field(
-        default=None, 
-        description="Immigration airport or seaport name (e.g., COCHIN AIRPORT, DEL, BOM)"
-    )
-    stamp_type: str = Field(
-        default="ENTRY", 
-        description="Detected stamp category: ENTRY / ARRIVAL or DEPARTURE / EXIT"
-    )
-    stay_permitted_until: Optional[str] = Field(
-        default=None, 
-        description="Handwritten or stamped stay permission limit if present"
-    )
-
+# Import externalized configuration and schemas
+from config import settings
+from schemas.stamp import StampExtractionResponse
 
 # ==============================================================================
-# 2. Global State & Model Lifespan Management
+# Model Lifespan & Global State
 # ==============================================================================
 
-# Global container for model and processor to load once into memory at startup
-ml_models = {}
+# Dictionary to hold the loaded model and tokenizer in RAM
+ml_state = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Loads the Qwen2-VL-2B-Instruct model and processor into CPU RAM once on startup.
-    Frees memory when the application shuts down.
+    Lifespan context manager:
+    Loads the Hugging Face vision model into CPU RAM once at application launch.
+    Ensures memory is cleaned up when shutting down.
     """
-    model_id = "Qwen/Qwen2-VL-2B-Instruct"
-    print(f"Loading vision model '{model_id}' into CPU memory... This may take a minute on first run.")
-
-    # AutoProcessor handles dynamic visual tokenization and text encoding
-    # We restrict min/max image pixels to keep CPU inference fast and prevent RAM exhaustion
+    print(f"[*] Initializing model '{settings.model_id}' on {settings.device.upper()}...")
+    
+    # AutoProcessor automatically adapts visual token patching
     processor = AutoProcessor.from_pretrained(
-        model_id, 
-        min_pixels=256 * 28 * 28, 
+        settings.model_id,
+        min_pixels=256 * 28 * 28,
         max_pixels=1024 * 28 * 28
     )
 
-    # Load model weights using standard 32-bit float for CPU execution
+    # Load model weights targeting CPU execution
     model = Qwen2VLForConditionalGeneration.from_pretrained(
-        model_id,
+        settings.model_id,
         torch_dtype=torch.float32,
-        device_map="cpu",
+        device_map=settings.device,
         low_cpu_mem_usage=True
     )
 
-    ml_models["processor"] = processor
-    ml_models["model"] = model
-    print("Vision model and processor successfully loaded into CPU RAM.")
+    # Store handles in global state
+    ml_state["processor"] = processor
+    ml_state["model"] = model
+    print("[*] Vision-Language Model loaded and ready.")
 
     yield
 
-    # Clean up on shutdown
-    ml_models.clear()
-    print("Unloaded vision model from memory.")
+    # Clean up upon server termination
+    ml_state.clear()
+    print("[*] Freed model resources from RAM.")
 
 
-# Initialize the FastAPI app with lifespan handler
+# ==============================================================================
+# FastAPI Application Initialization
+# ==============================================================================
+
 app = FastAPI(
-    title="Passport Stamp & Visa Capture API",
-    description="Local open-source CPU service using Qwen2-VL for passport stamps and visas.",
+    title="Passport Stamp Capture API",
+    description="Microservice for extracting arrival dates and ports of entry from passport ink stamps.",
     version="1.0.0",
     lifespan=lifespan
 )
 
 
 # ==============================================================================
-# 3. Helper Functions: Image Preprocessing & Inference
+# Image Processing Helper
 # ==============================================================================
 
-def prepare_image(upload_file: UploadFile) -> Image.Image:
+def prepare_uploaded_image(upload_file: UploadFile) -> Image.Image:
     """
-    Validates uploaded file, reads raw bytes, and converts to an RGB PIL Image.
-    Resizes image proportionally if dimensions exceed 1280px to optimize CPU speed.
+    Reads the uploaded image bytes, converts to RGB, and scales down oversized
+    dimensions according to config.py to ensure low inference latency on standard CPU.
     """
     try:
-        content = upload_file.file.read()
-        image = Image.open(io.BytesIO(content))
+        raw_bytes = upload_file.file.read()
+        image = Image.open(io.BytesIO(raw_bytes))
 
-        # Standardize color mode to RGB
+        # Ensure uniform RGB channels (converts RGBA, CMYK, etc.)
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        # Downscale oversized mobile captures to optimize standard CPU runtime
-        max_dim = 1280
+        # Downscale if the image exceeds the configured threshold
+        max_dim = settings.max_image_dimension
         if max(image.size) > max_dim:
             image.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
 
@@ -155,39 +103,60 @@ def prepare_image(upload_file: UploadFile) -> Image.Image:
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid image file: {str(exc)}"
+            detail=f"Unable to process image: {str(exc)}"
         )
 
 
-def execute_vlm_inference(image: Image.Image, system_prompt: str) -> dict:
+# ==============================================================================
+# Inference Handler
+# ==============================================================================
+
+def run_stamp_inference(image: Image.Image) -> dict:
     """
-    Runs the Qwen2-VL model on CPU with the specified image and instruction prompt.
-    Parses and extracts the JSON block generated by the model.
+    Executes Qwen2-VL vision inference on CPU and extracts the structured JSON response.
     """
-    processor = ml_models.get("processor")
-    model = ml_models.get("model")
+    processor = ml_state.get("processor")
+    model = ml_state.get("model")
 
     if not model or not processor:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Vision model is not loaded."
+            detail="Model is not initialized."
         )
 
-    # Construct chat-style message payload required by Qwen2-VL
+    # Prompt engineered to differentiate entry stamps from exit stamps and extract Form-C fields
+    prompt = (
+        "You are an immigration stamp inspection assistant.\n"
+        "Examine the image for passport immigration ink stamps (rectangular, circular, or oval ink marks).\n"
+        "1. Identify the ARRIVAL / ENTRY stamp (often contains 'ARRIVED', 'ENTRY', or incoming arrow).\n"
+        "2. Do NOT select EXIT / DEPARTURE stamps.\n"
+        "3. Extract the arrival date and normalize it to YYYY-MM-DD.\n"
+        "4. Extract the port of arrival (e.g., COCHIN AIRPORT, DEL, BOM, etc.).\n"
+        "Return ONLY a valid JSON object matching this schema:\n"
+        "{\n"
+        '  "is_stamp_detected": true,\n'
+        '  "arrival_date": "YYYY-MM-DD",\n'
+        '  "port_of_entry": "string",\n'
+        '  "stamp_type": "ENTRY",\n'
+        '  "stay_permitted_until": "string or null",\n'
+        '  "confidence_note": "string or null"\n'
+        "}\n"
+        "Do not include any explanation before or after the JSON."
+    )
+
+    # Prepare chat format
     messages = [
         {
             "role": "user",
             "content": [
                 {"type": "image", "image": image},
-                {"type": "text", "text": system_prompt}
+                {"type": "text", "text": prompt}
             ]
         }
     ]
 
-    # Format prompt text using Jinja chat template
+    # Preprocess prompt and visual patch tensors
     text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    
-    # Process visual tokens and inputs
     image_inputs, video_inputs = process_vision_info(messages)
     inputs = processor(
         text=[text_prompt],
@@ -197,132 +166,88 @@ def execute_vlm_inference(image: Image.Image, system_prompt: str) -> dict:
         return_tensors="pt"
     )
 
-    # Generate output tokens on CPU (greedy decoding for deterministic answers)
+    # Perform inference on CPU
     with torch.no_grad():
         generated_ids = model.generate(
             **inputs,
             max_new_tokens=256,
-            do_sample=False
+            do_sample=False  # Deterministic output
         )
 
-    # Slice output tokens to trim the input prompt tokens
+    # Decode tokens
     generated_ids_trimmed = [
         out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
     ]
-    raw_output = processor.batch_decode(
-        generated_ids_trimmed, 
-        skip_special_tokens=True, 
+    raw_text = processor.batch_decode(
+        generated_ids_trimmed,
+        skip_special_tokens=True,
         clean_up_tokenization_spaces=False
     )[0]
 
-    # Parse JSON from model response (handles raw JSON or ```json ... ``` code blocks)
+    # Parse JSON regex match
     try:
-        json_match = re.search(r"\{.*\}", raw_output, re.DOTALL)
-        if json_match:
-            return json.loads(json_match.group(0))
-        return json.loads(raw_output)
+        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        return json.loads(raw_text)
     except Exception:
-        # Fallback if the model produced unstructured text
-        return {"raw_response": raw_output}
+        return {"is_stamp_detected": False, "confidence_note": f"Raw output: {raw_text}"}
 
 
 # ==============================================================================
-# 4. Service Endpoints
+# API Endpoints (Path read dynamically from config)
 # ==============================================================================
 
-@app.post(
-    "/extract/visa",
-    response_model=VisaExtractionResponse,
-    summary="Extract Visa Details & Numbers",
-    tags=["Passport Services"]
-)
-async def extract_visa(
-    file: UploadFile = File(..., description="Image of passport page containing a visa sticker or consular stamp")
-):
-    """
-    Endpoint 1: Analyzes image to detect visa stickers or ink-stamped visas.
-    Extracts visa number, place of issue, dates, and handwritten officer annotations[cite: 1, 2].
-    """
-    image = prepare_image(file)
-
-    prompt = (
-        "You are an immigration document OCR expert. Analyze this image of a passport visa page.\n"
-        "Look for a visa sticker, e-Visa page, or consular ink-stamped visa.\n"
-        "Extract the following fields and return ONLY a valid JSON object:\n"
-        "{\n"
-        '  "is_visa_detected": true or false,\n'
-        '  "visa_number": "string or null",\n'
-        '  "place_of_issue": "string or null",\n'
-        '  "date_of_issue": "YYYY-MM-DD or null",\n'
-        '  "date_of_expiry": "YYYY-MM-DD or null",\n'
-        '  "visa_type": "string or null",\n'
-        '  "handwritten_notes": "any officer handwriting or manual remarks, or null"\n'
-        "}\n"
-        "Do not include any text before or after the JSON."
-    )
-
-    result_json = execute_vlm_inference(image, prompt)
-
-    # Standardize result through Pydantic
-    return VisaExtractionResponse(
-        is_visa_detected=result_json.get("is_visa_detected", False),
-        visa_number=result_json.get("visa_number"),
-        place_of_issue=result_json.get("place_of_issue"),
-        date_of_issue=result_json.get("date_of_issue"),
-        date_of_expiry=result_json.get("date_of_expiry"),
-        visa_type=result_json.get("visa_type"),
-        handwritten_notes=result_json.get("handwritten_notes")
-    )
-
+# Construct the full endpoint path dynamically from settings
+full_stamp_path = f"{settings.api_v1_prefix}{settings.stamp_extract_path}"
 
 @app.post(
-    "/extract/stamp",
+    full_stamp_path,
     response_model=StampExtractionResponse,
-    summary="Extract Landing / Entry Date & Port",
-    tags=["Passport Services"]
+    summary="Extract Arrival Date and Port from Immigration Ink Stamp",
+    tags=["Stamp Extraction"]
 )
-async def extract_stamp(
-    file: UploadFile = File(..., description="Image of passport page containing immigration ink stamps")
+async def extract_stamp_data(
+    file: UploadFile = File(..., description="Passport page image containing ink immigration stamps")
 ):
     """
-    Endpoint 2: Analyzes image to locate rubber ink immigration entry stamps[cite: 1, 2].
-    Extracts the arrival date and port of entry, ignoring departure/exit stamps[cite: 1, 2].
+    Scans the uploaded passport page for immigration arrival stamps,
+    extracting the landing date and port of entry for Form-C reporting[cite: 1, 2].
     """
-    image = prepare_image(file)
-
-    prompt = (
-        "You are an immigration stamp inspection assistant.\n"
-        "Examine the image for immigration ink stamps (rectangular or oval rubber stamps).\n"
-        "Identify the ARRIVAL / ENTRY stamp (marked 'ARRIVED', 'ENTRY', or incoming arrow).\n"
-        "Ignore EXIT / DEPARTURE stamps.\n"
-        "Extract the details and return ONLY a valid JSON object:\n"
-        "{\n"
-        '  "is_stamp_detected": true or false,\n'
-        '  "arrival_date": "arrival date normalized to YYYY-MM-DD or null",\n'
-        '  "port_of_entry": "immigration checkpoint airport/city name like COCHIN AIRPORT, DEL, BOM or null",\n'
-        '  "stamp_type": "ENTRY",\n'
-        '  "stay_permitted_until": "date or period if handwritten or stamped, or null"\n'
-        "}\n"
-        "Do not include any text before or after the JSON."
-    )
-
-    result_json = execute_vlm_inference(image, prompt)
-
+    image = prepare_uploaded_image(file)
+    extracted_data = run_stamp_inference(image)
+    
     return StampExtractionResponse(
-        is_stamp_detected=result_json.get("is_stamp_detected", False),
-        arrival_date=result_json.get("arrival_date"),
-        port_of_entry=result_json.get("port_of_entry"),
-        stamp_type=result_json.get("stamp_type", "ENTRY"),
-        stay_permitted_until=result_json.get("stay_permitted_until")
+        is_stamp_detected=extracted_data.get("is_stamp_detected", False),
+        arrival_date=extracted_data.get("arrival_date"),
+        port_of_entry=extracted_data.get("port_of_entry"),
+        stamp_type=extracted_data.get("stamp_type", "ENTRY"),
+        stay_permitted_until=extracted_data.get("stay_permitted_until"),
+        confidence_note=extracted_data.get("confidence_note")
     )
 
 
-@app.get("/health", tags=["Health"])
-def health_check():
-    """Confirms the API service is alive and model is initialized."""
-    model_ready = "model" in ml_models
+@app.get("/health", tags=["System"])
+def health():
+    """Health check endpoint displaying server runtime parameters."""
     return {
-        "status": "online" if model_ready else "initializing",
-        "device": "cpu",
-        "engine": "Qwen2-VL-2B-Instruct"
+        "status": "online" if "model" in ml_state else "initializing",
+        "configured_port": settings.app_port,
+        "configured_host": settings.app_host,
+        "stamp_endpoint": full_stamp_path,
+        "device": settings.device
     }
+
+
+# ==============================================================================
+# Application Entry Point
+# ==============================================================================
+
+if __name__ == "__main__":
+    # Runs uvicorn using configuration values defined in settings
+    uvicorn.run(
+        "app:app",
+        host=settings.app_host,
+        port=settings.app_port,
+        reload=False
+    )
