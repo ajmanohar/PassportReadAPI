@@ -138,10 +138,12 @@ We selected **Qwen2-VL-2B-Instruct** running via Hugging Face Transformers:
 
 #### Steps
 - Clone the repository:
+
 ```Bash
 git clone [https://github.com/ajmanohar/PassportReadAPI.git](https://github.com/ajmanohar/PassportReadAPI.git)
 cd PassportReadAPI
 ```
+
 - Create and activate a virtual environment:
 ```Bash
 python3 -m venv .venv
