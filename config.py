@@ -44,19 +44,19 @@ class Settings(BaseSettings):
     # --------------------------------------------------------------------------
     # Vision Token Resolution Bounds (CPU Latency Tuning)
     # --------------------------------------------------------------------------
-    # Downscale ceiling applied before feeding into the VLM processor (640px keeps text razor sharp)
-    max_image_dimension: int = 640
+    # Downscale dimension before passing into processor
+    max_image_dimension: int = 512
 
-    # Minimum visual tokens (64 patches * 28 * 28 pixels = 50,176 pixels)
-    min_pixels: int = 64 * 28 * 28
+    # Minimum visual tokens (49 patches * 28 * 28 pixels = 38,416 pixels)
+    min_pixels: int = 49 * 28 * 28
 
-    # Maximum visual tokens (256 patches * 28 * 28 pixels = 200,704 pixels)
-    # 256 tokens drops CPU attention matrix computation by 75% compared to 1024 tokens,
-    # ensuring complete inference finishes within 15-25 seconds and avoids Cloudflare 524 timeouts.
-    max_pixels: int = 256 * 28 * 28
+    # Maximum visual tokens (144 patches * 28 * 28 pixels = 112,896 pixels)
+    # 144 patches drops attention computation dramatically, ensuring CPU
+    # processing completes in 15-25 seconds and safely beats Cloudflare's 100s limit.
+    max_pixels: int = 144 * 28 * 28
 
-    # Upper bound on generated response tokens (JSON bio response is ~100-140 tokens)
-    max_new_tokens: int = 180
+    # Upper bound on generated response tokens (JSON bio response is ~90 tokens)
+    max_new_tokens: int = 128
 
     # --------------------------------------------------------------------------
     # Pydantic Settings Source Settings

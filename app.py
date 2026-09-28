@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
         max_pixels=settings.max_pixels
     )
 
-    # Load 32-bit float weights for deterministic execution on CPU hardware
+    # Load weights with float32 for deterministic CPU inference
     model = Qwen2VLForConditionalGeneration.from_pretrained(
         settings.model_id,
         torch_dtype=torch.float32,
@@ -82,7 +82,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Passport Stamp, Visa & Bio-Data Capture API",
     description="Local open-source CPU service for passport entry stamps, visa pages, and visual bio-data.",
-    version="1.2.1",
+    version="1.2.2",
     lifespan=lifespan
 )
 
@@ -138,8 +138,6 @@ def execute_vlm_query(image: Image.Image, system_prompt: str) -> dict:
         )
 
     # Format user prompt according to Qwen2-VL chat conversation template.
-    # Explicitly pass min_pixels and max_pixels in the image dict so qwen_vl_utils
-    # enforces the token bounds directly on the input image.
     messages = [
         {
             "role": "user",
@@ -222,14 +220,10 @@ async def extract_stamp_data(
     """
     image = prepare_uploaded_image(file)
 
+    # Concise prompt reduces prefill tokens and generation overhead
     prompt = (
-        "You are an immigration stamp inspection assistant.\n"
-        "Examine the uploaded image of a passport page containing entry/arrival immigration rubber stamps.\n"
-        "Locate the primary ARRIVAL or ENTRY stamp and extract:\n"
-        "1. arrival_date: The date stamped on arrival (format strictly as YYYY-MM-DD).\n"
-        "2. arrival_port: The port or airport of entry indicated on the stamp (e.g., 'COCHIN SEAPORT', 'DELHI AIRPORT', 'BOMBAY AIRPORT').\n"
-        "3. confidence_note: Short note on legibility and stamp identification.\n"
-        "Return the output strictly as a JSON object with keys: 'arrival_date', 'arrival_port', 'confidence_note'."
+        "Extract arrival stamp details from the image. Output valid JSON with keys: "
+        "'arrival_date' (YYYY-MM-DD), 'arrival_port', 'confidence_note'."
     )
 
     data = execute_vlm_query(image, prompt)
@@ -251,15 +245,9 @@ async def extract_visa_data(
     image = prepare_uploaded_image(file)
 
     prompt = (
-        "You are an expert immigration document processing assistant.\n"
-        "Examine the uploaded visa document or OCI page image and extract:\n"
-        "1. visa_number: The unique visa number or sticker number.\n"
-        "2. visa_type: The visa category (e.g., 'TOURIST', 'BUSINESS', 'CONFERENCE', 'OCI').\n"
-        "3. issue_date: Date of issue (format strictly as YYYY-MM-DD).\n"
-        "4. expiry_date: Date of expiry (format strictly as YYYY-MM-DD).\n"
-        "5. place_of_issue: Location or authority that issued the visa (e.g., 'LONDON', 'NEW YORK', 'PARIS').\n"
-        "6. confidence_note: Brief remarks on clarity or any damaged regions.\n"
-        "Return the output strictly as a JSON object with keys: 'visa_number', 'visa_type', 'issue_date', 'expiry_date', 'place_of_issue', 'confidence_note'."
+        "Extract visa details from the image. Output valid JSON with keys: "
+        "'visa_number', 'visa_type', 'issue_date' (YYYY-MM-DD), 'expiry_date' (YYYY-MM-DD), "
+        "'place_of_issue', 'confidence_note'."
     )
 
     data = execute_vlm_query(image, prompt)
@@ -281,18 +269,11 @@ async def extract_passport_bio_data(
     """
     image = prepare_uploaded_image(file)
 
+    # Direct concise prompt minimizes generation latency
     prompt = (
-        "You are a passport verification assistant.\n"
-        "Examine the uploaded passport biographical identity page and extract the following fields:\n"
-        "1. surname: The bearer's primary surname / family name.\n"
-        "2. given_names: The bearer's first name and any middle names.\n"
-        "3. passport_number: The unique document/passport number.\n"
-        "4. nationality: The nationality or issuing country.\n"
-        "5. date_of_birth: Date of birth (format strictly as YYYY-MM-DD).\n"
-        "6. sex: Gender ('M', 'F', or 'X').\n"
-        "7. expiry_date: Passport expiration date (format strictly as YYYY-MM-DD).\n"
-        "8. confidence_note: Short remarks on document legibility.\n"
-        "Return the output strictly as a JSON object with keys: 'surname', 'given_names', 'passport_number', 'nationality', 'date_of_birth', 'sex', 'expiry_date', 'confidence_note'."
+        "Extract passport bio data from the image. Output valid JSON with keys: "
+        "'surname', 'given_names', 'passport_number', 'nationality', "
+        "'date_of_birth' (YYYY-MM-DD), 'sex' ('M'/'F'), 'expiry_date' (YYYY-MM-DD), 'confidence_note'."
     )
 
     data = execute_vlm_query(image, prompt)
