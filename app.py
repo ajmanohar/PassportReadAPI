@@ -1,9 +1,7 @@
 """
-app.py
-------
-FastAPI microservice hosting passport entry stamp extraction,
-visa stamp/sticker extraction, and visual bio-data extraction (non-MRZ)
-on standard CPU using Qwen2-VL-2B-Instruct.
+Passport Stamp, Visa Page & Bio-Data Extraction Service
+FastAPI microservice executing deterministic CPU vision inference using Qwen2-VL-2B-Instruct.
+Includes optimized token bounds to prevent Cloudflare 100-second timeouts (Error 524).
 """
 
 import io
@@ -24,36 +22,36 @@ from schemas.stamp import StampExtractionResponse
 from schemas.visa import VisaExtractionResponse
 from schemas.passport_bio import PassportBioExtractionResponse
 
+
 # ==============================================================================
 # Model Lifespan Management
 # ==============================================================================
 
-# Dictionary holding in-memory references to the shared processor and model
+# Global state dictionary holding warm VLM model weights and tokenizers
 ml_state = {}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Loads Qwen2-VL-2B-Instruct once into CPU memory upon server boot.
-    Shared across visa, stamp, and passport bio extraction endpoints to avoid memory churn.
+    Manages startup and shutdown events for the FastAPI application.
+    Pre-warms the Qwen2-VL model and processor in host memory.
     """
     print(f"[*] Initializing model '{settings.model_id}' on device: {settings.device.upper()}...")
 
-    # Set PyTorch thread limit to avoid CPU core contention on standard multi-core servers
-    # Adjust or leave default based on server hardware threads
-    if torch.get_num_threads() > 4:
-        torch.set_num_threads(4)
+    # Configure PyTorch CPU thread count to maximize execution throughput
+    if settings.cpu_threads > 0:
+        torch.set_num_threads(settings.cpu_threads)
 
-    # AutoProcessor tokenizes image patches and text prompts
-    # min_pixels and max_pixels bound visual token resolution for optimal CPU latency
+    # AutoProcessor tokenizes image patches and text prompts.
+    # min_pixels and max_pixels bound visual token resolution to keep CPU inference under 30s.
     processor = AutoProcessor.from_pretrained(
         settings.model_id,
-        min_pixels=256 * 28 * 28,
-        max_pixels=1024 * 28 * 28
+        min_pixels=settings.min_pixels,
+        max_pixels=settings.max_pixels
     )
 
-    # Load 32-bit float weights for deterministic execution on standard CPU hardware
+    # Load 32-bit float weights for deterministic execution on CPU hardware
     model = Qwen2VLForConditionalGeneration.from_pretrained(
         settings.model_id,
         torch_dtype=torch.float32,
@@ -92,9 +90,8 @@ app = FastAPI(
 def prepare_uploaded_image(upload_file: UploadFile) -> Image.Image:
     """
     Reads incoming multipart binary bytes, confirms image legitimacy, standardizes
-    color channels to RGB, and scales down oversized images to maintain responsive CPU latency.
+    color channels to RGB, and downscales oversized phone photos to maintain CPU latency.
     """
-    # Verify content type starts with image/
     if upload_file.content_type and not upload_file.content_type.startswith("image/"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -105,11 +102,11 @@ def prepare_uploaded_image(upload_file: UploadFile) -> Image.Image:
         raw_bytes = upload_file.file.read()
         image = Image.open(io.BytesIO(raw_bytes))
 
-        # Standardize color profile to 3-channel RGB (removes alpha channel or CMYK artifacts)
+        # Standardize color profile to 3-channel RGB (removes alpha channels or CMYK artifacts)
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        # Downscale proportionally if largest dimension exceeds config bounds
+        # Downscale proportionally if largest dimension exceeds configured max bounds
         max_dim = settings.max_image_dimension
         if max(image.size) > max_dim:
             image.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
@@ -127,7 +124,6 @@ def execute_vlm_query(image: Image.Image, system_prompt: str) -> dict:
     Executes a structured query against the shared in-memory Qwen2-VL model
     and parses the output into a Python dictionary.
     """
-    # Fetch active model instances from lifespan storage
     processor = ml_state.get("processor")
     model = ml_state.get("model")
 
@@ -137,12 +133,19 @@ def execute_vlm_query(image: Image.Image, system_prompt: str) -> dict:
             detail="Vision model engine is not ready or has not been initialized."
         )
 
-    # Format user prompt according to Qwen2-VL chat conversation template
+    # Format user prompt according to Qwen2-VL chat conversation template.
+    # Explicitly pass min_pixels and max_pixels in the image dict so qwen_vl_utils
+    # enforces the token bounds directly on the input image.
     messages = [
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": image},
+                {
+                    "type": "image",
+                    "image": image,
+                    "min_pixels": settings.min_pixels,
+                    "max_pixels": settings.max_pixels
+                },
                 {"type": "text", "text": system_prompt}
             ]
         }
@@ -165,7 +168,7 @@ def execute_vlm_query(image: Image.Image, system_prompt: str) -> dict:
     with torch.no_grad():
         generated_ids = model.generate(
             **inputs,
-            max_new_tokens=320,
+            max_new_tokens=settings.max_new_tokens,
             do_sample=False
         )
 
@@ -181,7 +184,7 @@ def execute_vlm_query(image: Image.Image, system_prompt: str) -> dict:
         clean_up_tokenization_spaces=False
     )[0]
 
-    # Extract JSON string payload bounded by brackets
+    # Extract JSON string payload bounded by braces
     try:
         match = re.search(r"\{.*\}", raw_text, re.DOTALL)
         if match:
@@ -195,7 +198,6 @@ def execute_vlm_query(image: Image.Image, system_prompt: str) -> dict:
 # Service Endpoints
 # ==============================================================================
 
-# Dynamic route paths from central settings
 full_stamp_path = f"{settings.api_v1_prefix}{settings.stamp_extract_path}"
 full_visa_path = f"{settings.api_v1_prefix}{settings.visa_extract_path}"
 full_bio_path = f"{settings.api_v1_prefix}{settings.passport_bio_extract_path}"
@@ -218,170 +220,93 @@ async def extract_stamp_data(
 
     prompt = (
         "You are an immigration stamp inspection assistant.\n"
-        "Examine the image for passport immigration ink stamps (rectangular, circular, or oval ink marks).\n"
-        "1. Identify the ARRIVAL / ENTRY stamp (often contains 'ARRIVED', 'ENTRY', or incoming arrow).\n"
-        "2. Do NOT select EXIT / DEPARTURE stamps.\n"
-        "3. Extract the arrival date and normalize it to YYYY-MM-DD.\n"
-        "4. Extract the port of arrival (e.g., COCHIN AIRPORT, DEL, BOM, etc.).\n"
-        "Return ONLY a valid JSON object matching this schema:\n"
-        "{\n"
-        '  "is_stamp_detected": true,\n'
-        '  "arrival_date": "YYYY-MM-DD",\n'
-        '  "port_of_entry": "string",\n'
-        '  "stamp_type": "ENTRY",\n'
-        '  "stay_permitted_until": "string or null",\n'
-        '  "confidence_note": "string or null"\n'
-        "}\n"
-        "Do not include any explanation before or after the JSON."
+        "Examine the uploaded image of a passport page containing entry/arrival immigration rubber stamps.\n"
+        "Locate the primary ARRIVAL or ENTRY stamp and extract:\n"
+        "1. arrival_date: The date stamped on arrival (format strictly as YYYY-MM-DD).\n"
+        "2. arrival_port: The port or airport of entry indicated on the stamp (e.g., 'COCHIN SEAPORT', 'DELHI AIRPORT', 'BOMBAY AIRPORT').\n"
+        "3. confidence_note: Short note on legibility and stamp identification.\n"
+        "Return the output strictly as a JSON object with keys: 'arrival_date', 'arrival_port', 'confidence_note'."
     )
 
     data = execute_vlm_query(image, prompt)
-
-    return StampExtractionResponse(
-        is_stamp_detected=data.get("is_stamp_detected", False),
-        arrival_date=data.get("arrival_date"),
-        port_of_entry=data.get("port_of_entry"),
-        stamp_type=data.get("stamp_type", "ENTRY"),
-        stay_permitted_until=data.get("stay_permitted_until"),
-        confidence_note=data.get("confidence_note")
-    )
+    return StampExtractionResponse(**data)
 
 
 @app.post(
     full_visa_path,
     response_model=VisaExtractionResponse,
-    summary="Extract Visa Details, Numbers & Endorsements",
+    summary="Extract Visa Number, Type, and Validity Dates",
     tags=["Immigration Extraction"]
 )
 async def extract_visa_data(
-    file: UploadFile = File(..., description="Passport page image containing a visa sticker or consular stamp")
+    file: UploadFile = File(..., description="Image of Indian Visa sticker or Overseas Citizen of India (OCI) page")
 ):
     """
-    Extracts visa metadata, including printed/handwritten visa numbers, place of issue
-    (Form-C Field 4), issue/expiry dates, and handwritten officer annotations[cite: 1, 2].
+    Extracts visa number, date of issue, expiry date, and visa category/type.
     """
     image = prepare_uploaded_image(file)
 
     prompt = (
-        "You are an expert immigration document analyzer.\n"
-        "Examine the image of a passport visa page (sticker, e-Visa print, or consular ink stamp).\n"
-        "1. Identify if a valid visa is present.\n"
-        "2. Extract the Visa Number (alphanumeric, printed or handwritten).\n"
-        "3. Extract the Place of Issue (city or consulate name).\n"
-        "4. Extract the Date of Issue and Date of Expiry (normalize to YYYY-MM-DD).\n"
-        "5. Extract Visa Type and Entries allowed (Single, Double, Multiple).\n"
-        "6. Capture any handwritten officer remarks, pen notes, or endorsements.\n"
-        "Return ONLY a valid JSON object matching this schema:\n"
-        "{\n"
-        '  "is_visa_detected": true,\n'
-        '  "visa_number": "string or null",\n'
-        '  "place_of_issue": "string or null",\n'
-        '  "date_of_issue": "YYYY-MM-DD or null",\n'
-        '  "date_of_expiry": "YYYY-MM-DD or null",\n'
-        '  "visa_type": "string or null",\n'
-        '  "entries_allowed": "string or null",\n'
-        '  "handwritten_notes": "string or null",\n'
-        '  "confidence_note": "string or null"\n'
-        "}\n"
-        "Do not include any explanation before or after the JSON."
+        "You are an expert immigration document processing assistant.\n"
+        "Examine the uploaded visa document or OCI page image and extract:\n"
+        "1. visa_number: The unique visa number or sticker number.\n"
+        "2. visa_type: The visa category (e.g., 'TOURIST', 'BUSINESS', 'CONFERENCE', 'OCI').\n"
+        "3. issue_date: Date of issue (format strictly as YYYY-MM-DD).\n"
+        "4. expiry_date: Date of expiry (format strictly as YYYY-MM-DD).\n"
+        "5. place_of_issue: Location or authority that issued the visa (e.g., 'LONDON', 'NEW YORK', 'PARIS').\n"
+        "6. confidence_note: Brief remarks on clarity or any damaged regions.\n"
+        "Return the output strictly as a JSON object with keys: 'visa_number', 'visa_type', 'issue_date', 'expiry_date', 'place_of_issue', 'confidence_note'."
     )
 
     data = execute_vlm_query(image, prompt)
-
-    return VisaExtractionResponse(
-        is_visa_detected=data.get("is_visa_detected", False),
-        visa_number=data.get("visa_number"),
-        place_of_issue=data.get("place_of_issue"),
-        date_of_issue=data.get("date_of_issue"),
-        date_of_expiry=data.get("date_of_expiry"),
-        visa_type=data.get("visa_type"),
-        entries_allowed=data.get("entries_allowed"),
-        handwritten_notes=data.get("handwritten_notes"),
-        confidence_note=data.get("confidence_note")
-    )
+    return VisaExtractionResponse(**data)
 
 
 @app.post(
     full_bio_path,
     response_model=PassportBioExtractionResponse,
-    summary="Extract Passport Bio-Data from Visual Page (Non-MRZ Fallback)",
+    summary="Extract Passport Bio Page Details (Visual Fallback)",
     tags=["Immigration Extraction"]
 )
 async def extract_passport_bio_data(
-    file: UploadFile = File(..., description="Passport biodata identity page image (works even if MRZ is cut off or missing)")
+    file: UploadFile = File(..., description="Passport identity page image")
 ):
     """
-    Extracts guest identity information directly from the Visual Inspection Zone (VIZ)
-    of a passport page when the bottom MRZ lines are obscured, cropped, or illegible.
-    Maps directly to Form-C Field 1 (Name) and Field 3 (Nationality)[cite: 7, 8].
+    Extracts visual text fields from passport photo identity page:
+    Given names, surname, passport number, nationality, date of birth, sex, and expiry.
     """
-    # Preprocess image dimensions and color profile
     image = prepare_uploaded_image(file)
 
-    # Prompt designed to extract visual label-value pairs without requiring OCR-B MRZ text
     prompt = (
-        "You are an expert document analyzer specializing in international passport bio-data pages.\n"
-        "Analyze the passport page image using ONLY visual text fields (even if the bottom MRZ line is cropped, blurry, or missing).\n"
-        "Extract the following details accurately:\n"
-        "1. Passport Number (Document Number, often in top-right or body).\n"
-        "2. Surname / Family Name.\n"
-        "3. Given Names / First and Middle Names.\n"
-        "4. Combine Surname and Given Names formatted as 'SURNAME, GIVEN NAMES'.\n"
-        "5. Nationality (Country name or 3-letter code).\n"
-        "6. Date of Birth, Date of Issue, and Date of Expiry (normalize all dates to YYYY-MM-DD).\n"
-        "7. Sex / Gender ('M', 'F', or 'X').\n"
-        "8. Place of Birth (City / Country).\n"
-        "Return ONLY a valid JSON object matching this schema:\n"
-        "{\n"
-        '  "is_passport_detected": true,\n'
-        '  "passport_number": "string or null",\n'
-        '  "surname": "string or null",\n'
-        '  "given_names": "string or null",\n'
-        '  "full_name": "string or null",\n'
-        '  "nationality": "string or null",\n'
-        '  "date_of_birth": "YYYY-MM-DD or null",\n'
-        '  "sex": "string or null",\n'
-        '  "place_of_birth": "string or null",\n'
-        '  "date_of_issue": "YYYY-MM-DD or null",\n'
-        '  "date_of_expiry": "YYYY-MM-DD or null",\n'
-        '  "confidence_note": "string or null"\n'
-        "}\n"
-        "Do not include any conversational text or markdown codeblocks outside the JSON."
+        "You are a passport verification assistant.\n"
+        "Examine the uploaded passport biographical identity page and extract the following fields:\n"
+        "1. surname: The bearer's primary surname / family name.\n"
+        "2. given_names: The bearer's first name and any middle names.\n"
+        "3. passport_number: The unique document/passport number.\n"
+        "4. nationality: The nationality or issuing country.\n"
+        "5. date_of_birth: Date of birth (format strictly as YYYY-MM-DD).\n"
+        "6. sex: Gender ('M', 'F', or 'X').\n"
+        "7. expiry_date: Passport expiration date (format strictly as YYYY-MM-DD).\n"
+        "8. confidence_note: Short remarks on document legibility.\n"
+        "Return the output strictly as a JSON object with keys: 'surname', 'given_names', 'passport_number', 'nationality', 'date_of_birth', 'sex', 'expiry_date', 'confidence_note'."
     )
 
     data = execute_vlm_query(image, prompt)
-
-    # Construct and return validated Pydantic model
-    return PassportBioExtractionResponse(
-        is_passport_detected=data.get("is_passport_detected", False),
-        passport_number=data.get("passport_number"),
-        surname=data.get("surname"),
-        given_names=data.get("given_names"),
-        full_name=data.get("full_name") or f"{data.get('surname', '')} {data.get('given_names', '')}".strip() or None,
-        nationality=data.get("nationality"),
-        date_of_birth=data.get("date_of_birth"),
-        sex=data.get("sex"),
-        place_of_birth=data.get("place_of_birth"),
-        date_of_issue=data.get("date_of_issue"),
-        date_of_expiry=data.get("date_of_expiry"),
-        confidence_note=data.get("confidence_note")
-    )
+    return PassportBioExtractionResponse(**data)
 
 
-@app.get("/health", tags=["System"])
-def health():
-    """Health check endpoint indicating active endpoints and runtime parameters."""
+@app.get("/health", summary="Health check endpoint", tags=["System"])
+async def health_check():
+    """
+    Verifies that the microservice is running and the model is initialized.
+    """
+    is_ready = ml_state.get("model") is not None and ml_state.get("processor") is not None
     return {
-        "status": "online" if "model" in ml_state else "initializing",
+        "status": "healthy" if is_ready else "initializing",
+        "model_loaded": is_ready,
         "device": settings.device,
-        "model_id": settings.model_id,
-        "configured_host": settings.app_host,
-        "configured_port": settings.app_port,
-        "endpoints": {
-            "stamp_extraction": full_stamp_path,
-            "visa_extraction": full_visa_path,
-            "passport_bio_extraction": full_bio_path
-        }
+        "max_pixels": settings.max_pixels,
+        "min_pixels": settings.min_pixels
     }
 
 
