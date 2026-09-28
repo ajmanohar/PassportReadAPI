@@ -1,12 +1,10 @@
-# Passport Read API
+# Passport Stamp, Visa & Bio-Data Extraction API (`PassportReadAPI`)
 
-An open-source, local microservice engineered to extract arrival dates, ports of entry, visa numbers, and handwritten consular annotations from scanned or photographed passport pages including bio-page. 
-
-This service feeds directly into the Bureau of Immigration **Form-C** arrival report requirements for homestays and hospitality establishments (specifically Field 4: *Place of issue of visa*, Field 5: *Date of Arrival in India*, and Field 12: *Country & city you arrived to India*).
+A high-performance, deterministic Vision-Language Model (VLM) microservice powered by FastAPI and Hugging Face Transformers (`Qwen/Qwen2-VL-2B-Instruct`). Designed specifically for offline or local edge server deployments (such as an Intel CPU Dell Micro desktop) to support document parsing and verification for homestay registration and Bureau of Immigration Form-C reporting.
 
 ---
 
-## 1. Architectural Evolution & Tech Stack History
+## Architectural Evolution & Tech Stack History
 
 #### The Problem with Traditional OCR
 Standard passport bio-data pages adhere to strict ICAO 9303 standards with Machine Readable Zones (MRZ). However, immigration stamp pages and visa pages are unstructured and noisy:
@@ -17,6 +15,52 @@ Traditional OCR engines (such as Tesseract or mobile ML Kit) produce disjointed 
 
 #### Why Not Cloud APIs?
 While commercial multimodal vision APIs (like Google Gemini Vision) perform well, they incur recurring per-call fees and require an active internet connection. The objective was a **100% free, privacy-first, on-premise, open-source solution**.
+
+
+## Architecture & Deployment 
+
+* **Host Architecture:** Ubuntu 24.04 LTS (Headless Dell Micro Server).
+* **Execution Hardware:** Multithreaded CPU inference (`torch.float32`) without requiring dedicated Nvidia GPUs.
+* **Service Daemon:** Managed as an unprivileged, self-healing systemd service (`passport-read-api.service`).
+* **Zero Trust & Edge Ingress:**
+  * Strict `ufw` firewall drops all unsolicited inbound WAN traffic.
+  * Internal access restricted to the encrypted **Tailscale mesh network**.
+  * Public HTTPS ingestion routed via a permanent named **Cloudflare Tunnel** proxying directly to `localhost:8000`.
+
+---
+
+## Latency & Cloudflare 524 Optimization
+
+Cloudflare enforces a strict **100-second proxy timeout** on standard edge tunnels. To prevent HTTP 524 timeout drops during CPU inference:
+
+1. **Token Bounds:** Visual patches are capped between 49 and 144 patches (`min_pixels = 49 * 28 * 28`, `max_pixels = 144 * 28 * 28`). This bounds attention matrix computation while keeping printed MRZ codes and passport typography legible.
+2. **Dimension Rescaling:** High-resolution mobile phone camera captures (12MP+) are downsampled to a maximum dimension of 512px prior to tensor conversion.
+3. **Multithreaded Scheduling:** PyTorch explicitly schedules compute across all available physical CPU cores via `torch.set_num_threads()` and `torch.set_num_interop_threads()`.
+4. **Streamlined Prompting:** Prompt prefill token counts are minimized to limit generation latency to 15–25 seconds.
+
+---
+
+## API Endpoints
+
+### 1. Extract Passport Bio Page Data
+* **Route:** `POST /api/v1/extract/passport-bio`
+* **Payload:** `multipart/form-data` with key `file` (image).
+* **Response Schema:**
+```json
+{
+  "surname": "DOE",
+  "given_names": "JOHN",
+  "passport_number": "A12345678",
+  "nationality": "USA",
+  "date_of_birth": "1985-06-15",
+  "sex": "M",
+  "expiry_date": "2030-06-14",
+  "confidence_note": "Extracted with high visual legibility."
+}
+```
+
+
+
 
 #### Model Selection: Qwen2-VL-2B-Instruct
 We selected **Qwen2-VL-2B-Instruct** running via Hugging Face Transformers:
