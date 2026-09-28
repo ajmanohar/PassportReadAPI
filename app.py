@@ -1,11 +1,12 @@
 """
 Passport Stamp, Visa Page & Bio-Data Extraction Service
 FastAPI microservice executing deterministic CPU vision inference using Qwen2-VL-2B-Instruct.
-Includes optimized token bounds to prevent Cloudflare 100-second timeouts (Error 524).
+Includes optimized token bounds and multithreaded CPU scheduling to prevent Cloudflare 524 timeouts.
 """
 
 import io
 import json
+import os
 import re
 from contextlib import asynccontextmanager
 
@@ -35,16 +36,19 @@ ml_state = {}
 async def lifespan(app: FastAPI):
     """
     Manages startup and shutdown events for the FastAPI application.
-    Pre-warms the Qwen2-VL model and processor in host memory.
+    Configures CPU thread scheduling and pre-warms the Qwen2-VL model and processor.
     """
     print(f"[*] Initializing model '{settings.model_id}' on device: {settings.device.upper()}...")
 
-    # Configure PyTorch CPU thread count to maximize execution throughput
-    if settings.cpu_threads > 0:
-        torch.set_num_threads(settings.cpu_threads)
+    # Configure PyTorch CPU thread count to maximize execution throughput across all available cores
+    available_cores = os.cpu_count() or 4
+    active_threads = settings.cpu_threads if settings.cpu_threads > 0 else available_cores
+    torch.set_num_threads(active_threads)
+    torch.set_num_interop_threads(active_threads)
+    print(f"[*] PyTorch CPU compute threads configured to: {active_threads}")
 
     # AutoProcessor tokenizes image patches and text prompts.
-    # min_pixels and max_pixels bound visual token resolution to keep CPU inference under 30s.
+    # min_pixels and max_pixels bound visual token resolution for fast CPU latency.
     processor = AutoProcessor.from_pretrained(
         settings.model_id,
         min_pixels=settings.min_pixels,
@@ -78,7 +82,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Passport Stamp, Visa & Bio-Data Capture API",
     description="Local open-source CPU service for passport entry stamps, visa pages, and visual bio-data.",
-    version="1.2.0",
+    version="1.2.1",
     lifespan=lifespan
 )
 

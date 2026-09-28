@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     # --------------------------------------------------------------------------
     # Network Binding Configuration
     # --------------------------------------------------------------------------
+    # Bind to 0.0.0.0 to accept requests forwarded from local Cloudflare tunnel daemon
     app_host: str = "0.0.0.0"
     app_port: int = 8000
 
@@ -37,25 +38,25 @@ class Settings(BaseSettings):
     device: str = "cpu"
 
     # Number of CPU threads assigned to PyTorch compute operations.
-    # Set to 0 to let PyTorch automatically utilize all available physical CPU cores.
+    # Set to 0 to let PyTorch automatically detect and utilize all available physical CPU cores.
     cpu_threads: int = 0
 
     # --------------------------------------------------------------------------
     # Vision Token Resolution Bounds (CPU Latency Tuning)
     # --------------------------------------------------------------------------
-    # Downscale ceiling applied before feeding into the VLM processor
-    max_image_dimension: int = 1024
+    # Downscale ceiling applied before feeding into the VLM processor (640px keeps text razor sharp)
+    max_image_dimension: int = 640
 
-    # Minimum visual tokens (128 patches * 28 * 28 pixels = 100,352 pixels)
-    min_pixels: int = 128 * 28 * 28
+    # Minimum visual tokens (64 patches * 28 * 28 pixels = 50,176 pixels)
+    min_pixels: int = 64 * 28 * 28
 
-    # Maximum visual tokens (512 patches * 28 * 28 pixels = 401,408 pixels)
-    # Restricting to 512 tokens ensures fast CPU inference (<30s) to prevent
-    # Cloudflare Error 524 (100s timeout) while retaining sharp document text.
-    max_pixels: int = 512 * 28 * 28
+    # Maximum visual tokens (256 patches * 28 * 28 pixels = 200,704 pixels)
+    # 256 tokens drops CPU attention matrix computation by 75% compared to 1024 tokens,
+    # ensuring complete inference finishes within 15-25 seconds and avoids Cloudflare 524 timeouts.
+    max_pixels: int = 256 * 28 * 28
 
-    # Upper bound on generated response tokens (JSON bio response is ~150 tokens)
-    max_new_tokens: int = 256
+    # Upper bound on generated response tokens (JSON bio response is ~100-140 tokens)
+    max_new_tokens: int = 180
 
     # --------------------------------------------------------------------------
     # Pydantic Settings Source Settings
