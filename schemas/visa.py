@@ -1,52 +1,58 @@
 """
-schemas/visa.py
----------------
-Pydantic response models for passport visa page extraction.
-Directly aligns with Form-C fields:
-- place_of_issue -> Form-C Field 4: 'Place of issue of visa'
-- visa_number    -> Form-C visa identification number
+Pydantic data schemas for synchronous Visa and OCI extraction using Qwen2-VL.
+Standardizes extracted fields to use FieldResult with confidence metrics and source tracking.
 """
 
 from typing import Optional
 from pydantic import BaseModel, Field
 
-class VisaExtractionResponse(BaseModel):
+# Reusable structured field result model
+from schemas.job import FieldResult
+
+
+class VisaResponse(BaseModel):
     """
-    Structured extraction response for visa pages (stickers or rubber consular stamps).
+    Standardized response structure for Visa and OCI document extraction.
+    Returns per-field confidence scores and source provenance.
     """
-    is_visa_detected: bool = Field(
-        default=False,
-        description="True if a valid visa sticker, e-Visa, or consular ink stamp was found"
+    # Visa or OCI document number
+    visa_number: FieldResult = Field(
+        default_factory=FieldResult,
+        description="Indian Visa number or OCI registration number"
     )
-    visa_number: Optional[str] = Field(
-        default=None,
-        description="Extracted alphanumeric visa number (printed or handwritten)"
+
+    # Visa category or class (Tourist, Business, Entry, OCI, etc.)
+    visa_type: FieldResult = Field(
+        default_factory=FieldResult,
+        description="Type or class of the visa"
     )
-    place_of_issue: Optional[str] = Field(
-        default=None,
-        description="City, mission, or consulate where the visa was issued (Form-C Field 4)"
+
+    # Date visa was issued (YYYY-MM-DD)
+    visa_issue_date: FieldResult = Field(
+        default_factory=FieldResult,
+        description="Date of visa issuance formatted as YYYY-MM-DD"
     )
-    date_of_issue: Optional[str] = Field(
-        default=None,
-        description="Visa issue date normalized to YYYY-MM-DD"
+
+    # Date visa expires (YYYY-MM-DD)
+    visa_expiry_date: FieldResult = Field(
+        default_factory=FieldResult,
+        description="Date of visa expiration formatted as YYYY-MM-DD"
     )
-    date_of_expiry: Optional[str] = Field(
-        default=None,
-        description="Visa expiration date normalized to YYYY-MM-DD"
+
+    # Place or mission where visa was granted
+    visa_place_of_issue: FieldResult = Field(
+        default_factory=FieldResult,
+        description="City or embassy where the visa was issued"
     )
-    visa_type: Optional[str] = Field(
-        default=None,
-        description="Category of visa (e.g., Tourist, Business, Entry, e-Visa, OCI)"
-    )
-    entries_allowed: Optional[str] = Field(
-        default=None,
-        description="Number of entries allowed: Single (S), Double (D), or Multiple (M)"
-    )
-    handwritten_notes: Optional[str] = Field(
-        default=None,
-        description="Any manual officer remarks, endorsements, or pen-written notes"
-    )
+
+    # Explanatory note from vision model regarding document readability
     confidence_note: Optional[str] = Field(
         default=None,
-        description="Notes regarding ink darkness, blur, overlapping marks, or legibility"
+        description="Qualitative assessment of visual legibility and clarity"
+    )
+
+    # Execution status indicator string
+    status: str = Field(
+        default="success",
+        description="Execution status of the visa extraction pipeline"
     )
