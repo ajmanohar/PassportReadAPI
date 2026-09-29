@@ -1,7 +1,7 @@
 """
 FastAPI router for synchronous Passport MRZ extraction using Tesseract and PassportEye.
 Extracts ICAO Doc 9303 machine-readable zones and assigns deterministic confidence scores
-based on mathematical check-digit validations.
+based on mathematical check-digit validations, returning the standardized MRZExtractionResponse.
 """
 
 import io
@@ -9,14 +9,19 @@ import logging
 from typing import Dict, Any, Optional
 
 from fastapi import APIRouter, File, UploadFile, HTTPException, status
-from pydantic import BaseModel, Field
 from passporteye import read_mrz
 
-# Shared schema for confidence tracking
+# Centralized schema models
 from schemas.job import FieldResult
+from schemas.passport_mrz import MRZExtractionResponse
 
+# Set up dedicated logger
 logger = logging.getLogger("mrz_router")
 logger.setLevel(logging.INFO)
+
+# ==============================================================================
+# Router Configuration
+# ==============================================================================
 
 router = APIRouter(
     prefix="/api/v1/mrz",
@@ -24,52 +29,24 @@ router = APIRouter(
 )
 
 
-class MRZExtractionResponse(BaseModel):
-    """
-    Synchronous response structure for MRZ extraction returning structured
-    FieldResult instances with individual confidence metrics and checksum status.
-    """
-    # Holder's family surname
-    surname: FieldResult = Field(default_factory=FieldResult, description="Extracted surname")
-
-    # Holder's secondary given names
-    given_names: FieldResult = Field(default_factory=FieldResult, description="Extracted given names")
-
-    # Unique passport identification code
-    passport_number: FieldResult = Field(default_factory=FieldResult, description="Passport number")
-
-    # 3-letter ICAO country code of citizenship
-    nationality: FieldResult = Field(default_factory=FieldResult, description="3-letter nationality code")
-
-    # Date of birth (YYMMDD format from MRZ)
-    date_of_birth: FieldResult = Field(default_factory=FieldResult, description="Date of birth")
-
-    # Biological sex code ('M', 'F', 'X')
-    sex: FieldResult = Field(default_factory=FieldResult, description="Sex code")
-
-    # Document expiration date (YYMMDD format from MRZ)
-    passport_expiry_date: FieldResult = Field(default_factory=FieldResult, description="Expiration date")
-
-    # True if overall composite checksum matches ICAO specifications
-    valid_mrz: bool = Field(default=False, description="Overall validity indicator")
-
-    # Raw recognition score (0 - 100) provided by PassportEye
-    valid_score: int = Field(default=0, description="PassportEye OCR detection score")
-
-    # Status indicator string
-    status: str = Field(default="success", description="Execution result status")
-
+# ==============================================================================
+# Diagnostic Probes
+# ==============================================================================
 
 @router.get("/health", summary="MRZ Service Diagnostic Probe")
 def mrz_health_check() -> Dict[str, str]:
     """
-    Verifies that the Tesseract OCR engine and PassportEye dependencies are reachable.
+    Verifies that the Tesseract OCR engine and PassportEye dependencies are operational.
     """
     return {
         "status": "healthy",
         "engine": "Tesseract OCR / PassportEye (ICAO Doc 9303)"
     }
 
+
+# ==============================================================================
+# Synchronous MRZ Extraction Endpoint
+# ==============================================================================
 
 @router.post(
     "/extract",
@@ -82,10 +59,10 @@ async def extract_mrz_data(
 ) -> MRZExtractionResponse:
     """
     Synchronously reads an uploaded passport image, scans for 2-line or 3-line MRZ codes,
-    verifies checksums, and returns field-level confidence ratings.
+    verifies checksums, and returns field-level confidence ratings mapped into FieldResult.
     """
     try:
-        # Read uploaded image bytes into memory buffer
+        # Read uploaded image bytes into in-memory buffer
         contents = await file.read()
         image_stream = io.BytesIO(contents)
 
@@ -108,8 +85,7 @@ async def extract_mrz_data(
         # Base confidence for non-checksum text fields derived from detection score
         base_text_confidence = round(max(0.0, min(1.0, valid_score / 100.0)), 2)
 
-        # Inspect internal checksum check attributes from PassportEye
-        # Check digit validation checks: 'check_number', 'check_date_of_birth', 'check_expiration_date', 'check_composite'
+        # Inspect internal checksum attributes from PassportEye
         check_number = getattr(mrz_record, "check_number", False)
         check_dob = getattr(mrz_record, "check_date_of_birth", False)
         check_exp = getattr(mrz_record, "check_expiration_date", False)
@@ -124,7 +100,7 @@ async def extract_mrz_data(
                 return 0.0
             return 0.99 if check_passed else 0.30
 
-        # Helper to assign score to raw text fields (Surname, Given Names, Nationality, Sex)
+        # Helper to assign score to raw text fields
         def score_text_field(val: Optional[str]) -> float:
             if not val:
                 return 0.0
