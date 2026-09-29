@@ -1,6 +1,6 @@
 """
 Pydantic data schemas for ICAO Doc 9303 MRZ extraction via PassportEye & Tesseract OCR.
-Defines response structures for health diagnostics and parsed passport records.
+Defines sanitized response structures for health diagnostics and parsed passport records.
 """
 
 from typing import Optional, List
@@ -9,24 +9,19 @@ from pydantic import BaseModel, Field
 
 class HealthStatusResponse(BaseModel):
     """
-    Health diagnostic model verifying Tesseract OCR binary availability on the host system.
+    Health diagnostic model verifying Tesseract OCR engine availability.
+    Sanitized to avoid exposing host operating system file paths or server internals.
     """
-    # Overall service status
+    # Overall health indicator of the MRZ sub-service ('healthy' or 'degraded')
     status: str = Field(
         default="healthy",
-        description="Health indicator of the MRZ sub-service"
+        description="Operational health indicator of the MRZ sub-service"
     )
 
-    # Boolean flag indicating whether the Tesseract executable was resolved
-    tesseract_detected: bool = Field(
+    # Boolean flag indicating whether the Tesseract OCR engine is verified and ready
+    ocr_engine_ready: bool = Field(
         ...,
-        description="True if the Tesseract binary exists at the configured path"
-    )
-
-    # Path to the detected Tesseract binary or error notice
-    tesseract_path: str = Field(
-        ...,
-        description="Resolved path of the tesseract binary on the host operating system"
+        description="True if the Tesseract OCR engine binary is detected and operational"
     )
 
 
@@ -35,7 +30,7 @@ class PassportDataResponse(BaseModel):
     Structured extraction payload representing parsed ICAO Doc 9303 passport bio-data.
     Tailored for Form-C immigration reporting and guest identity validation.
     """
-    # Cryptographic checksum validation score
+    # Cryptographic checksum validation score (True if check digits match calculations)
     valid_mrz: bool = Field(
         ...,
         description="True if all ICAO Doc 9303 check digits match checksum calculations"

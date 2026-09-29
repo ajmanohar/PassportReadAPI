@@ -61,18 +61,18 @@ initialize_tesseract_environment()
 @router.get(
     "/health",
     response_model=HealthStatusResponse,
-    summary="Health check for Tesseract OCR binary",
+    summary="Health check for Tesseract OCR engine",
     tags=["Passport MRZ (Tesseract OCR)"]
 )
 def tesseract_health_check() -> HealthStatusResponse:
     """
-    Verifies that the configured Tesseract executable is present on the host filesystem.
+    Verifies that the configured Tesseract executable is present on the host filesystem
+    without leaking internal host paths to public callers.
     """
     binary_found = os.path.isfile(settings.tesseract_cmd)
     return HealthStatusResponse(
         status="healthy" if binary_found else "degraded",
-        tesseract_detected=binary_found,
-        tesseract_path=settings.tesseract_cmd if binary_found else "Binary Not Found"
+        ocr_engine_ready=binary_found
     )
 
 
