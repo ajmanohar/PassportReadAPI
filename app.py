@@ -1,7 +1,7 @@
 """
 FastAPI application for Form-C document information extraction.
-Integrates synchronous Qwen2-VL vision endpoints, Tesseract MRZ parsing,
-and an asynchronous sequential batch processing queue for multi-document workflows.
+Integrates synchronous Qwen2-VL vision endpoints with per-field confidence scoring,
+Tesseract MRZ parsing, and an asynchronous sequential batch processing queue for multi-document workflows.
 """
 
 import asyncio
@@ -15,6 +15,7 @@ from typing import Dict, Any, Optional
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from PIL import Image
 import torch
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
@@ -29,12 +30,52 @@ from routers.jobs_router import router as jobs_router
 from storage.db import initialize_database, reset_interrupted_jobs
 from services.job_worker import background_queue_worker, job_queue
 
+# Schema models
+from schemas.job import FieldResult
+
 # Configure application-level logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("passport_api")
 
 # Global dictionary holding loaded model artifacts in system memory
 ml_models: Dict[str, Any] = {}
+
+
+# ==============================================================================
+# Synchronous Response Schema for Passport Bio
+# ==============================================================================
+
+class PassportBioExtractionResponse(BaseModel):
+    """
+    Synchronous response structure for Qwen2-VL passport extraction returning
+    per-field confidence metrics and source attribution.
+    """
+    # Extracted surname
+    surname: FieldResult = Field(default_factory=FieldResult, description="Holder's surname / family name")
+
+    # Extracted given names
+    given_names: FieldResult = Field(default_factory=FieldResult, description="Holder's given names")
+
+    # Document identification number
+    passport_number: FieldResult = Field(default_factory=FieldResult, description="Passport identifier number")
+
+    # 3-letter ICAO country code or country name
+    nationality: FieldResult = Field(default_factory=FieldResult, description="Holder's nationality")
+
+    # Birth date (YYYY-MM-DD)
+    date_of_birth: FieldResult = Field(default_factory=FieldResult, description="Date of birth")
+
+    # Holder's sex ('M', 'F', 'X')
+    sex: FieldResult = Field(default_factory=FieldResult, description="Sex code")
+
+    # Passport expiry date (YYYY-MM-DD)
+    passport_expiry_date: FieldResult = Field(default_factory=FieldResult, description="Passport expiration date")
+
+    # Diagnostic observation from the vision model
+    confidence_note: Optional[str] = Field(default=None, description="Model explanation of image legibility")
+
+    # Status indicator string
+    status: str = Field(default="success", description="Execution result status")
 
 
 # ==============================================================================
@@ -54,10 +95,13 @@ async def lifespan(app: FastAPI):
     """
     logger.info(f"[*] Initializing model '{settings.model_id}' on device: {settings.device.upper()}...")
 
-    # Configure PyTorch CPU compute threads for Dell server
-    if settings.device.lower() == "cpu" and settings.torch_cpu_threads > 0:
-        torch.set_num_threads(settings.torch_cpu_threads)
-        logger.info(f"[*] PyTorch CPU compute threads configured to: {settings.torch_cpu_threads}")
+    # PyTorch CPU thread pinning using safe getattr
+    torch_threads = getattr(settings, "torch_cpu_threads", None)
+    if settings.device.lower() == "cpu" and torch_threads is not None and torch_threads > 0:
+        torch.set_num_threads(torch_threads)
+        logger.info(f"[*] PyTorch CPU compute threads configured to: {torch_threads}")
+    else:
+        logger.info("[*] PyTorch CPU compute threads using system default allocation.")
 
     compute_dtype = torch.bfloat16 if settings.device.lower() == "cpu" else torch.float16
 
@@ -118,10 +162,18 @@ async def lifespan(app: FastAPI):
 # FastAPI Application Instantiation
 # ==============================================================================
 
+app_title = getattr(settings, "api_title", "Passport and Visa OCR Extraction API")
+app_version = getattr(settings, "api_version", "1.0.0")
+app_description = getattr(
+    settings,
+    "api_description",
+    "High-throughput document extraction combining Qwen2-VL vision models, Tesseract MRZ parsing, and asynchronous batch processing."
+)
+
 app = FastAPI(
-    title=settings.api_title,
-    version=settings.api_version,
-    description=settings.api_description,
+    title=app_title,
+    version=app_version,
+    description=app_description,
     lifespan=lifespan
 )
 
@@ -225,27 +277,84 @@ def execute_vlm_query(image: Image.Image, system_prompt: str) -> dict:
         return {"raw_output": raw_text, "confidence_note": "Failed to parse structured JSON."}
 
 
+def build_field_result_from_vlm(raw_value: Optional[str], raw_conf: Any) -> FieldResult:
+    """
+    Normalizes VLM extraction and confidence into a validated FieldResult.
+    Applies heuristic validation to bound confidence between 0.0 and 1.0.
+    """
+    if not raw_value or str(raw_value).strip().lower() in ["null", "none", ""]:
+        return FieldResult(value=None, confidence=0.0, source="qwen2_vl")
+
+    cleaned_val = str(raw_value).strip()
+
+    # Parse confidence float
+    try:
+        score = float(raw_conf)
+        score = max(0.0, min(1.0, score))
+    except (ValueError, TypeError):
+        score = 0.70  # Default fallback score for detected text without explicit valid float
+
+    return FieldResult(
+        value=cleaned_val,
+        confidence=round(score, 2),
+        source="qwen2_vl"
+    )
+
+
 # ==============================================================================
-# Existing Synchronous VLM Endpoints (Preserved Intact)
+# Synchronous VLM Endpoints
 # ==============================================================================
 
 @app.post(
     "/api/v1/extract/passport",
-    summary="Synchronous Passport Bio-Data Extraction via Qwen2-VL",
+    response_model=PassportBioExtractionResponse,
+    summary="Synchronous Passport Bio-Data Extraction via Qwen2-VL with Field Confidence",
     tags=["Synchronous Extraction"]
 )
-async def extract_passport_bio(file: UploadFile = File(...)):
+async def extract_passport_bio(file: UploadFile = File(...)) -> PassportBioExtractionResponse:
     """
-    Extracts holder surname, given names, passport number, nationality, DOB, and expiry.
+    Extracts passport bio-data fields along with individual visual confidence scores
+    rated from 0.0 (uncertain/blurred) to 1.0 (crystal clear).
     """
     image_bytes = await file.read()
     image = validate_and_load_image(image_bytes)
+
     prompt = (
-        "Extract passport bio data from the image. Output valid JSON with keys: "
-        "'surname', 'given_names', 'passport_number', 'nationality', "
-        "'date_of_birth', 'sex', 'expiry_date', 'confidence_note'."
+        "Carefully read the passport bio page image. For each field, provide the extracted string value "
+        "and your visual confidence score between 0.0 and 1.0 based on clarity and legibility. "
+        "Return valid JSON formatted exactly with this structure:\n"
+        "{\n"
+        '  "surname": {"value": "...", "confidence": 0.95},\n'
+        '  "given_names": {"value": "...", "confidence": 0.95},\n'
+        '  "passport_number": {"value": "...", "confidence": 0.90},\n'
+        '  "nationality": {"value": "...", "confidence": 0.95},\n'
+        '  "date_of_birth": {"value": "YYYY-MM-DD", "confidence": 0.90},\n'
+        '  "sex": {"value": "M or F", "confidence": 0.95},\n'
+        '  "expiry_date": {"value": "YYYY-MM-DD", "confidence": 0.90},\n'
+        '  "confidence_note": "short explanation of image quality"\n'
+        "}"
     )
-    return execute_vlm_query(image, prompt)
+
+    raw_response = execute_vlm_query(image, prompt)
+
+    # Helper to parse nested or flat response patterns from VLM
+    def parse_field(field_name: str) -> FieldResult:
+        entry = raw_response.get(field_name)
+        if isinstance(entry, dict):
+            return build_field_result_from_vlm(entry.get("value"), entry.get("confidence", 0.85))
+        return build_field_result_from_vlm(entry, raw_response.get(f"{field_name}_confidence", 0.80))
+
+    return PassportBioExtractionResponse(
+        surname=parse_field("surname"),
+        given_names=parse_field("given_names"),
+        passport_number=parse_field("passport_number"),
+        nationality=parse_field("nationality"),
+        date_of_birth=parse_field("date_of_birth"),
+        sex=parse_field("sex"),
+        passport_expiry_date=parse_field("expiry_date"),
+        confidence_note=raw_response.get("confidence_note", "Visual extraction complete."),
+        status="success"
+    )
 
 
 @app.post(
