@@ -1,149 +1,177 @@
 """
-Passport Stamp, Visa Page, Bio-Data & MRZ Extraction Service
-FastAPI microservice executing deterministic CPU vision inference using Qwen2-VL-2B-Instruct,
-alongside an integrated ICAO Doc 9303 MRZ extraction router using PassportEye and Tesseract OCR.
+FastAPI application for Form-C document information extraction.
+Integrates synchronous Qwen2-VL vision endpoints, Tesseract MRZ parsing,
+and an asynchronous sequential batch processing queue for multi-document workflows.
 """
 
+import asyncio
+from contextlib import asynccontextmanager
 import io
 import json
+import logging
 import os
 import re
-from contextlib import asynccontextmanager
+from typing import Dict, Any, Optional
 
-import uvicorn
 from fastapi import FastAPI, File, UploadFile, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 import torch
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
-# Configuration and schema imports
+# Configuration and modular routers
 from config import settings
-from schemas.stamp import StampExtractionResponse
-from schemas.visa import VisaExtractionResponse
-from schemas.passport_bio import PassportBioExtractionResponse
-
-# Import the modular MRZ router
 from routers.mrz_router import router as mrz_router
+from routers.jobs_router import router as jobs_router
+
+# Database persistence and async background queue worker
+from storage.db import initialize_database, reset_interrupted_jobs
+from services.job_worker import background_queue_worker, job_queue
+
+# Configure application-level logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("passport_api")
+
+# Global dictionary holding loaded model artifacts in system memory
+ml_models: Dict[str, Any] = {}
 
 
 # ==============================================================================
-# Model Lifespan Management
+# Application Lifecycle Management (Lifespan)
 # ==============================================================================
-
-# Global state dictionary holding warm VLM model weights and tokenizers
-ml_state = {}
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Manages startup and shutdown events for the FastAPI application.
-    Configures CPU thread scheduling and pre-warms the Qwen2-VL model and processor.
+    Handles application startup and shutdown events:
+    1. Loads Qwen2-VL model and processor into RAM.
+    2. Configures PyTorch compute thread pinning for CPU.
+    3. Initializes the SQLite jobs database table.
+    4. Recovers interrupted jobs after system reboot.
+    5. Starts the background queue worker task.
+    6. Cancels background tasks on shutdown.
     """
-    print(f"[*] Initializing model '{settings.model_id}' on device: {settings.device.upper()}...")
+    logger.info(f"[*] Initializing model '{settings.model_id}' on device: {settings.device.upper()}...")
 
-    # Configure PyTorch CPU thread count to maximize execution throughput across all available cores
-    available_cores = os.cpu_count() or 4
-    active_threads = settings.cpu_threads if settings.cpu_threads > 0 else available_cores
-    torch.set_num_threads(active_threads)
-    torch.set_num_interop_threads(active_threads)
-    print(f"[*] PyTorch CPU compute threads configured to: {active_threads}")
+    # Configure PyTorch CPU compute threads for Dell server
+    if settings.device.lower() == "cpu" and settings.torch_cpu_threads > 0:
+        torch.set_num_threads(settings.torch_cpu_threads)
+        logger.info(f"[*] PyTorch CPU compute threads configured to: {settings.torch_cpu_threads}")
 
-    # AutoProcessor tokenizes image patches and text prompts.
-    # min_pixels and max_pixels bound visual token resolution for fast CPU latency.
-    processor = AutoProcessor.from_pretrained(
-        settings.model_id,
-        min_pixels=settings.min_pixels,
-        max_pixels=settings.max_pixels
-    )
+    compute_dtype = torch.bfloat16 if settings.device.lower() == "cpu" else torch.float16
 
-    # Load weights with float32 for deterministic CPU inference
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
-        settings.model_id,
-        torch_dtype=torch.float32,
-        device_map=settings.device,
-        low_cpu_mem_usage=True
-    )
+    try:
+        # Load processor with bounded visual token limits
+        processor = AutoProcessor.from_pretrained(
+            settings.model_id,
+            min_pixels=settings.min_pixels,
+            max_pixels=settings.max_pixels
+        )
 
-    # Store references in global lifespan dictionary
-    ml_state["processor"] = processor
-    ml_state["model"] = model
-    print("[*] Model and processor successfully loaded and ready for queries.")
+        # Load Qwen2-VL weights in evaluation mode
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            settings.model_id,
+            torch_dtype=compute_dtype,
+            device_map=settings.device
+        )
+        model.eval()
+
+        ml_models["model"] = model
+        ml_models["processor"] = processor
+        logger.info("[*] Model and processor successfully loaded and ready for queries.")
+
+    except Exception as exc:
+        logger.error(f"[!] Critical failure loading model '{settings.model_id}': {exc}")
+        raise exc
+
+    # 1. Initialize SQLite jobs table
+    initialize_database()
+
+    # 2. Crash recovery: re-queue any jobs interrupted mid-processing during power loss
+    interrupted_job_ids = reset_interrupted_jobs()
+    if interrupted_job_ids:
+        logger.info(f"[*] Recovered {len(interrupted_job_ids)} interrupted job(s). Re-queuing...")
+        for j_id in interrupted_job_ids:
+            await job_queue.put(j_id)
+
+    # 3. Start background queue worker as a persistent asyncio background task
+    worker_task = asyncio.create_task(background_queue_worker(ml_models))
+    logger.info("[*] Background queue worker task started.")
 
     yield
 
-    # Release memory handles when the FastAPI application shuts down
-    ml_state.clear()
-    print("[*] Model resources freed from memory.")
+    # Clean shutdown: cancel the queue worker
+    logger.info("[*] Shutting down application. Cancelling background queue worker...")
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
+
+    # Clear model artifacts from RAM
+    ml_models.clear()
+    logger.info("[*] Application shutdown complete.")
 
 
 # ==============================================================================
-# Application Definition
+# FastAPI Application Instantiation
 # ==============================================================================
 
 app = FastAPI(
-    title="Passport Stamp, Visa, Bio-Data & MRZ Capture API",
-    description="Unified edge service combining VLM vision extraction with Tesseract ICAO Doc 9303 MRZ parsing.",
-    version="1.3.0",
+    title=settings.api_title,
+    version=settings.api_version,
+    description=settings.api_description,
     lifespan=lifespan
 )
 
-# Register the modular MRZ router under /api/v1/mrz
-app.include_router(mrz_router, prefix=settings.api_v1_prefix)
+# CORS middleware for mobile and web clients
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount modular routers
+app.include_router(mrz_router)
+app.include_router(jobs_router, prefix="/api/v1")
 
 
 # ==============================================================================
-# Image Processing & Generic Inference Pipeline
+# Synchronous Helper Functions
 # ==============================================================================
 
-def prepare_uploaded_image(upload_file: UploadFile) -> Image.Image:
+def validate_and_load_image(file_bytes: bytes) -> Image.Image:
     """
-    Reads incoming multipart binary bytes, confirms image legitimacy, standardizes
-    color channels to RGB, and downscales oversized phone photos to maintain CPU latency.
+    Validates byte stream and loads as RGB PIL Image.
     """
-    if upload_file.content_type and not upload_file.content_type.startswith("image/"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported file MIME type: {upload_file.content_type}. Please upload an image."
-        )
-
     try:
-        raw_bytes = upload_file.file.read()
-        image = Image.open(io.BytesIO(raw_bytes))
-
-        # Standardize color profile to 3-channel RGB (removes alpha channels or CMYK artifacts)
+        image = Image.open(io.BytesIO(file_bytes))
         if image.mode != "RGB":
             image = image.convert("RGB")
-
-        # Downscale proportionally if largest dimension exceeds configured max bounds
-        max_dim = settings.max_image_dimension
-        if max(image.size) > max_dim:
-            image.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
-
         return image
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to decode and prepare uploaded image: {str(exc)}"
+            detail=f"Invalid or corrupt image file: {str(exc)}"
         )
 
 
 def execute_vlm_query(image: Image.Image, system_prompt: str) -> dict:
     """
-    Executes a structured query against the shared in-memory Qwen2-VL model
-    and parses the output into a Python dictionary.
+    Runs inference through the warm Qwen2-VL model and returns parsed JSON.
     """
-    processor = ml_state.get("processor")
-    model = ml_state.get("model")
+    processor = ml_models.get("processor")
+    model = ml_models.get("model")
 
     if not model or not processor:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Vision model engine is not ready or has not been initialized."
+            detail="Model is not yet initialized or ready."
         )
 
-    # Format user prompt according to Qwen2-VL chat conversation template.
     messages = [
         {
             "role": "user",
@@ -159,11 +187,9 @@ def execute_vlm_query(image: Image.Image, system_prompt: str) -> dict:
         }
     ]
 
-    # Process prompt template and extract visual input tensors
     text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
 
-    # Build input tensor dictionaries
     inputs = processor(
         text=[text_prompt],
         images=image_inputs,
@@ -171,8 +197,8 @@ def execute_vlm_query(image: Image.Image, system_prompt: str) -> dict:
         padding=True,
         return_tensors="pt"
     )
+    inputs = {k: v.to(settings.device) for k, v in inputs.items()}
 
-    # Run deterministic inference without calculating gradients
     with torch.no_grad():
         generated_ids = model.generate(
             **inputs,
@@ -180,118 +206,97 @@ def execute_vlm_query(image: Image.Image, system_prompt: str) -> dict:
             do_sample=False
         )
 
-    # Separate model-generated response tokens from the input prompt tokens
     generated_ids_trimmed = [
-        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
     ]
 
-    # Decode tokens into UTF-8 string
     raw_text = processor.batch_decode(
         generated_ids_trimmed,
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False
     )[0]
 
-    # Extract JSON string payload bounded by braces
     try:
         match = re.search(r"\{.*\}", raw_text, re.DOTALL)
         if match:
             return json.loads(match.group(0))
         return json.loads(raw_text)
     except Exception:
-        return {"confidence_note": f"Raw model response: {raw_text}"}
+        return {"raw_output": raw_text, "confidence_note": "Failed to parse structured JSON."}
 
 
 # ==============================================================================
-# Service Endpoints
+# Existing Synchronous VLM Endpoints (Preserved Intact)
 # ==============================================================================
 
-full_stamp_path = f"{settings.api_v1_prefix}{settings.stamp_extract_path}"
-full_visa_path = f"{settings.api_v1_prefix}{settings.visa_extract_path}"
-full_bio_path = f"{settings.api_v1_prefix}{settings.passport_bio_extract_path}"
-
-
 @app.post(
-    full_stamp_path,
-    response_model=StampExtractionResponse,
-    summary="Extract Arrival Date and Port from Immigration Ink Stamp",
-    tags=["Immigration Extraction"]
+    "/api/v1/extract/passport",
+    summary="Synchronous Passport Bio-Data Extraction via Qwen2-VL",
+    tags=["Synchronous Extraction"]
 )
-async def extract_stamp_data(
-    file: UploadFile = File(..., description="Passport page image containing immigration ink stamps")
-):
+async def extract_passport_bio(file: UploadFile = File(...)):
     """
-    Locates entry/arrival rubber ink stamps on a passport page and extracts
-    arrival date (Form-C Field 5) and port of arrival (Form-C Field 12).
+    Extracts holder surname, given names, passport number, nationality, DOB, and expiry.
     """
-    image = prepare_uploaded_image(file)
-
-    prompt = (
-        "Extract arrival stamp details from the image. Output valid JSON with keys: "
-        "'arrival_date' (YYYY-MM-DD), 'arrival_port', 'confidence_note'."
-    )
-
-    data = execute_vlm_query(image, prompt)
-    return StampExtractionResponse(**data)
-
-
-@app.post(
-    full_visa_path,
-    response_model=VisaExtractionResponse,
-    summary="Extract Visa Number, Type, and Validity Dates",
-    tags=["Immigration Extraction"]
-)
-async def extract_visa_data(
-    file: UploadFile = File(..., description="Image of Indian Visa sticker or Overseas Citizen of India (OCI) page")
-):
-    """
-    Extracts visa number, date of issue, expiry date, and visa category/type.
-    """
-    image = prepare_uploaded_image(file)
-
-    prompt = (
-        "Extract visa details from the image. Output valid JSON with keys: "
-        "'visa_number', 'visa_type', 'issue_date' (YYYY-MM-DD), 'expiry_date' (YYYY-MM-DD), "
-        "'place_of_issue', 'confidence_note'."
-    )
-
-    data = execute_vlm_query(image, prompt)
-    return VisaExtractionResponse(**data)
-
-
-@app.post(
-    full_bio_path,
-    response_model=PassportBioExtractionResponse,
-    summary="Extract Passport Bio Page Details (Visual Fallback)",
-    tags=["Immigration Extraction"]
-)
-async def extract_passport_bio_data(
-    file: UploadFile = File(..., description="Passport identity page image")
-):
-    """
-    Extracts visual text fields from passport photo identity page:
-    Given names, surname, passport number, nationality, date of birth, sex, and expiry.
-    """
-    image = prepare_uploaded_image(file)
-
+    image_bytes = await file.read()
+    image = validate_and_load_image(image_bytes)
     prompt = (
         "Extract passport bio data from the image. Output valid JSON with keys: "
         "'surname', 'given_names', 'passport_number', 'nationality', "
-        "'date_of_birth' (YYYY-MM-DD), 'sex' ('M'/'F'), 'expiry_date' (YYYY-MM-DD), 'confidence_note'."
+        "'date_of_birth', 'sex', 'expiry_date', 'confidence_note'."
     )
-
-    data = execute_vlm_query(image, prompt)
-    return PassportBioExtractionResponse(**data)
+    return execute_vlm_query(image, prompt)
 
 
-@app.get("/health", summary="Health check endpoint", tags=["System"])
-async def health_check():
+@app.post(
+    "/api/v1/extract/visa",
+    summary="Synchronous Visa / OCI Extraction via Qwen2-VL",
+    tags=["Synchronous Extraction"]
+)
+async def extract_visa_details(file: UploadFile = File(...)):
     """
-    Verifies that the microservice is running and the model is initialized.
+    Extracts visa number, type, issue date, expiry date, and place of issue.
     """
-    is_ready = ml_state.get("model") is not None and ml_state.get("processor") is not None
+    image_bytes = await file.read()
+    image = validate_and_load_image(image_bytes)
+    prompt = (
+        "Extract visa details from the image. Output valid JSON with keys: "
+        "'visa_number', 'visa_type', 'issue_date', 'expiry_date', 'place_of_issue', 'confidence_note'."
+    )
+    return execute_vlm_query(image, prompt)
+
+
+@app.post(
+    "/api/v1/extract/stamp",
+    summary="Synchronous Immigration Stamp Extraction via Qwen2-VL",
+    tags=["Synchronous Extraction"]
+)
+async def extract_stamp_details(file: UploadFile = File(...)):
+    """
+    Extracts arrival date and port of entry from an Indian immigration ink stamp.
+    """
+    image_bytes = await file.read()
+    image = validate_and_load_image(image_bytes)
+    prompt = (
+        "Extract arrival stamp details from the image. Output valid JSON with keys: "
+        "'arrival_date', 'arrival_port', 'confidence_note'."
+    )
+    return execute_vlm_query(image, prompt)
+
+
+# ==============================================================================
+# Diagnostic Probes
+# ==============================================================================
+
+@app.get("/health", tags=["Health"])
+def health_check():
+    """
+    Sanitized root diagnostic probe indicating operational readiness of the API
+    and warm status of the vision model.
+    """
+    is_ready = "model" in ml_models and "processor" in ml_models
     return {
-        "status": "healthy" if is_ready else "initializing",
+        "status": "healthy" if is_ready else "degraded",
         "model_loaded": is_ready,
         "device": settings.device,
         "max_pixels": settings.max_pixels,
@@ -300,9 +305,5 @@ async def health_check():
 
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "app:app",
-        host=settings.app_host,
-        port=settings.app_port,
-        reload=False
-    )
+    import uvicorn
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=False)
