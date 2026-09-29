@@ -4,12 +4,14 @@ Provides non-blocking intake endpoints for multi-document bundles,
 enqueuing background extraction tasks and exposing status polling routes.
 """
 
+import logging
 import os
 import shutil
 import uuid
 from typing import List, Optional
 
 from fastapi import APIRouter, File, UploadFile, HTTPException, status
+from pydantic import ValidationError
 
 # Configuration, database, and schema imports
 from config import settings
@@ -21,6 +23,10 @@ from schemas.job import (
     GuestFormCRecord
 )
 from services.job_worker import job_queue
+
+# Configure router logger
+logger = logging.getLogger("jobs_router")
+logger.setLevel(logging.INFO)
 
 # ==============================================================================
 # Router Configuration & Storage Paths
@@ -120,6 +126,7 @@ async def submit_documents_job(
 
     # 7. Push job identifier to the serial background queue
     await job_queue.put(job_id)
+    logger.info(f"[*] Ingested job {job_id} and queued for processing.")
 
     return JobSubmissionResponse(
         job_id=job_id,
@@ -140,7 +147,7 @@ async def submit_documents_job(
 async def get_job_status(job_id: str) -> JobDetailResponse:
     """
     Returns current execution state (QUEUED, PROCESSING, COMPLETED, FAILED).
-    When COMPLETED, returns the fused Form-C guest record.
+    When COMPLETED, returns the fused Form-C guest record with field-level confidence ratings.
     """
     job_record = get_job(job_id)
     if not job_record:
@@ -149,10 +156,14 @@ async def get_job_status(job_id: str) -> JobDetailResponse:
             detail=f"Job with ID '{job_id}' not found."
         )
 
-    # Map raw dictionary into GuestFormCRecord if complete
-    result_record = None
+    # Defensively map raw dictionary into GuestFormCRecord if processing finished
+    result_record: Optional[GuestFormCRecord] = None
     if job_record.get("result"):
-        result_record = GuestFormCRecord(**job_record["result"])
+        try:
+            result_record = GuestFormCRecord(**job_record["result"])
+        except (ValidationError, TypeError, Exception) as parse_err:
+            logger.warning(f"Could not strictly validate result for job {job_id}: {parse_err}")
+            result_record = None
 
     return JobDetailResponse(
         job_id=job_record["job_id"],
@@ -180,9 +191,13 @@ async def list_jobs(limit: int = 50) -> List[JobDetailResponse]:
     jobs = list_recent_jobs(limit=limit)
     response_items = []
     for item in jobs:
-        result_record = None
+        result_record: Optional[GuestFormCRecord] = None
         if item.get("result"):
-            result_record = GuestFormCRecord(**item["result"])
+            try:
+                result_record = GuestFormCRecord(**item["result"])
+            except Exception as parse_err:
+                logger.warning(f"Error parsing job {item.get('job_id')} result: {parse_err}")
+                result_record = None
 
         response_items.append(
             JobDetailResponse(
