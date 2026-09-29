@@ -1,68 +1,70 @@
 """
-schemas/passport_bio.py
------------------------
-Pydantic data models for passport bio-data page extraction when 
-the Machine Readable Zone (MRZ) is cut off, smudged, or missing entirely.
-
-Extracts data from the Visual Inspection Zone (VIZ) to feed Form-C:
-- Name of foreigner (Surname First) -> Form-C Field 1
-- Nationality                      -> Form-C Field 3
-- Passport Number & Expiry Dates   -> Guest Identification
+Pydantic data schemas for synchronous Passport Bio-Data visual extraction via Qwen2-VL.
+Standardizes every extracted field to use FieldResult with confidence metrics and source attribution.
 """
 
 from typing import Optional
 from pydantic import BaseModel, Field
 
+# Reusable structured field result model
+from schemas.job import FieldResult
 
-class PassportBioExtractionResponse(BaseModel):
+
+class PassportBioResponse(BaseModel):
     """
-    Structured response schema representing non-MRZ passport bio-data.
+    Standardized synchronous response structure for Passport Bio page visual extraction.
+    Returns per-field confidence scores (0.0 to 1.0) and source provenance ('qwen2_vl').
     """
-    is_passport_detected: bool = Field(
-        default=False,
-        description="True if a valid passport identity/bio page was identified"
+    # Holder's surname / family name
+    surname: FieldResult = Field(
+        default_factory=FieldResult,
+        description="Holder's surname or family name"
     )
-    passport_number: Optional[str] = Field(
-        default=None,
-        description="Alphanumeric document/passport number extracted from header or page body"
+
+    # Holder's secondary given names
+    given_names: FieldResult = Field(
+        default_factory=FieldResult,
+        description="Holder's given names"
     )
-    surname: Optional[str] = Field(
-        default=None,
-        description="Holder's family name / surname (Forms Field 1 Surname)"
+
+    # Unique passport identifier number
+    passport_number: FieldResult = Field(
+        default_factory=FieldResult,
+        description="Passport document identification number"
     )
-    given_names: Optional[str] = Field(
-        default=None,
-        description="Holder's first and middle names"
+
+    # Holder's nationality (3-letter country code or full name)
+    nationality: FieldResult = Field(
+        default_factory=FieldResult,
+        description="Country of citizenship or nationality"
     )
-    full_name: Optional[str] = Field(
-        default=None,
-        description="Full concatenated name (Surname First) as requested by Form-C Field 1"
+
+    # Date of birth (YYYY-MM-DD or document string)
+    date_of_birth: FieldResult = Field(
+        default_factory=FieldResult,
+        description="Date of birth formatted as YYYY-MM-DD"
     )
-    nationality: Optional[str] = Field(
-        default=None,
-        description="Country code or full nationality name (Form-C Field 3)"
+
+    # Biological sex code ('M', 'F', or 'X')
+    sex: FieldResult = Field(
+        default_factory=FieldResult,
+        description="Sex code ('M', 'F', or 'X')"
     )
-    date_of_birth: Optional[str] = Field(
-        default=None,
-        description="Date of birth normalized to YYYY-MM-DD"
+
+    # Document expiration date (YYYY-MM-DD)
+    passport_expiry_date: FieldResult = Field(
+        default_factory=FieldResult,
+        description="Passport expiration date formatted as YYYY-MM-DD"
     )
-    sex: Optional[str] = Field(
-        default=None,
-        description="Gender / Sex marker: M, F, or X"
-    )
-    place_of_birth: Optional[str] = Field(
-        default=None,
-        description="City and/or country where the document holder was born"
-    )
-    date_of_issue: Optional[str] = Field(
-        default=None,
-        description="Passport issuance date normalized to YYYY-MM-DD"
-    )
-    date_of_expiry: Optional[str] = Field(
-        default=None,
-        description="Passport expiration date normalized to YYYY-MM-DD"
-    )
+
+    # Model explanation regarding visual legibility or image artifacts
     confidence_note: Optional[str] = Field(
         default=None,
-        description="Inspection notes regarding glare, missing MRZ lines, or obscured fields"
+        description="Qualitative assessment of image clarity and document legibility"
+    )
+
+    # Execution status indicator
+    status: str = Field(
+        default="success",
+        description="Execution status of the visual extraction pipeline"
     )
