@@ -1,7 +1,7 @@
 """
-Passport Stamp, Visa Page & Bio-Data Extraction Service
-FastAPI microservice executing deterministic CPU vision inference using Qwen2-VL-2B-Instruct.
-Includes optimized token bounds and multithreaded CPU scheduling to prevent Cloudflare 524 timeouts.
+Passport Stamp, Visa Page, Bio-Data & MRZ Extraction Service
+FastAPI microservice executing deterministic CPU vision inference using Qwen2-VL-2B-Instruct,
+alongside an integrated ICAO Doc 9303 MRZ extraction router using PassportEye and Tesseract OCR.
 """
 
 import io
@@ -22,6 +22,9 @@ from config import settings
 from schemas.stamp import StampExtractionResponse
 from schemas.visa import VisaExtractionResponse
 from schemas.passport_bio import PassportBioExtractionResponse
+
+# Import the modular MRZ router
+from routers.mrz_router import router as mrz_router
 
 
 # ==============================================================================
@@ -80,11 +83,14 @@ async def lifespan(app: FastAPI):
 # ==============================================================================
 
 app = FastAPI(
-    title="Passport Stamp, Visa & Bio-Data Capture API",
-    description="Local open-source CPU service for passport entry stamps, visa pages, and visual bio-data.",
-    version="1.2.2",
+    title="Passport Stamp, Visa, Bio-Data & MRZ Capture API",
+    description="Unified edge service combining VLM vision extraction with Tesseract ICAO Doc 9303 MRZ parsing.",
+    version="1.3.0",
     lifespan=lifespan
 )
+
+# Register the modular MRZ router under /api/v1/mrz
+app.include_router(mrz_router, prefix=settings.api_v1_prefix)
 
 
 # ==============================================================================
@@ -220,7 +226,6 @@ async def extract_stamp_data(
     """
     image = prepare_uploaded_image(file)
 
-    # Concise prompt reduces prefill tokens and generation overhead
     prompt = (
         "Extract arrival stamp details from the image. Output valid JSON with keys: "
         "'arrival_date' (YYYY-MM-DD), 'arrival_port', 'confidence_note'."
@@ -269,7 +274,6 @@ async def extract_passport_bio_data(
     """
     image = prepare_uploaded_image(file)
 
-    # Direct concise prompt minimizes generation latency
     prompt = (
         "Extract passport bio data from the image. Output valid JSON with keys: "
         "'surname', 'given_names', 'passport_number', 'nationality', "
