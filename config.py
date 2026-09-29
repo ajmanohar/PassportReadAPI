@@ -1,61 +1,85 @@
 """
-Configuration management for the Passport Stamp, Visa & Bio-Data Capture API.
-Loads runtime environment variables dynamically so that host, port,
-routes, and vision-language model parameters can be configured easily.
+Configuration management for the Passport Stamp, Visa, Bio-Data & MRZ Capture API.
+Loads runtime environment variables dynamically so that host, port, routes,
+Tesseract binary paths, and vision-language model parameters are configured cleanly.
 """
 
 import os
+import platform
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def resolve_default_tesseract_binary() -> str:
+    """
+    Detects the operating system platform and resolves the default path
+    to the Tesseract OCR executable.
+    """
+    system_name = platform.system()
+    if system_name == "Windows":
+        # Standard Windows installation directory
+        return r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    else:
+        # Standard Ubuntu / Debian Linux binary location
+        return "/usr/bin/tesseract"
+
+
+def resolve_default_tessdata_dir() -> str:
+    """
+    Detects the operating system platform and resolves the default directory
+    housing language training data (tessdata).
+    """
+    system_name = platform.system()
+    if system_name == "Windows":
+        # Standard Windows tessdata directory
+        return r"C:\Program Files\Tesseract-OCR\tessdata"
+    else:
+        # Standard Ubuntu / Debian Linux tessdata location
+        return "/usr/share/tesseract-ocr/4.00/tessdata"
 
 
 class Settings(BaseSettings):
     """
     Central settings model for network binding, route endpoints,
-    and Vision-Language Model (VLM) CPU execution parameters.
+    Tesseract OCR paths, and Vision-Language Model (VLM) execution parameters.
     """
     # --------------------------------------------------------------------------
     # Network Binding Configuration
     # --------------------------------------------------------------------------
-    # Bind to 0.0.0.0 to accept requests forwarded from local Cloudflare tunnel daemon
+    # Bind to 0.0.0.0 to accept traffic forwarded by local tunnels or reverse proxies
     app_host: str = "0.0.0.0"
     app_port: int = 8000
 
     # --------------------------------------------------------------------------
-    # API Route Endpoints
+    # API Route Endpoints & Prefixes
     # --------------------------------------------------------------------------
     api_v1_prefix: str = "/api/v1"
     stamp_extract_path: str = "/extract/stamp"
     visa_extract_path: str = "/extract/visa"
     passport_bio_extract_path: str = "/extract/passport-bio"
+    mrz_router_prefix: str = "/mrz"
+
+    # --------------------------------------------------------------------------
+    # Tesseract OCR & PassportEye Configuration
+    # --------------------------------------------------------------------------
+    # Resolves binary path with runtime environment variable override support
+    tesseract_cmd: str = os.getenv("TESSERACT_CMD", resolve_default_tesseract_binary())
+    tessdata_prefix: str = os.getenv("TESSDATA_PREFIX", resolve_default_tessdata_dir())
 
     # --------------------------------------------------------------------------
     # Vision Language Model (VLM) Architecture & Hardware Allocation
     # --------------------------------------------------------------------------
-    # Hugging Face repository identifier for Qwen2-VL-2B
     model_id: str = "Qwen/Qwen2-VL-2B-Instruct"
-
-    # Target compute device ('cpu' for Intel Dell Micro without Nvidia GPU)
     device: str = "cpu"
 
-    # Number of CPU threads assigned to PyTorch compute operations.
-    # Set to 0 to let PyTorch automatically detect and utilize all available physical CPU cores.
+    # Number of CPU threads assigned to PyTorch compute operations (0 = all cores)
     cpu_threads: int = 0
 
     # --------------------------------------------------------------------------
     # Vision Token Resolution Bounds (CPU Latency Tuning)
     # --------------------------------------------------------------------------
-    # Downscale dimension before passing into processor
     max_image_dimension: int = 512
-
-    # Minimum visual tokens (49 patches * 28 * 28 pixels = 38,416 pixels)
     min_pixels: int = 49 * 28 * 28
-
-    # Maximum visual tokens (144 patches * 28 * 28 pixels = 112,896 pixels)
-    # 144 patches drops attention computation dramatically, ensuring CPU
-    # processing completes in 15-25 seconds and safely beats Cloudflare's 100s limit.
     max_pixels: int = 144 * 28 * 28
-
-    # Upper bound on generated response tokens (JSON bio response is ~90 tokens)
     max_new_tokens: int = 128
 
     # --------------------------------------------------------------------------
@@ -68,5 +92,5 @@ class Settings(BaseSettings):
     )
 
 
-# Instantiate a singleton configuration object for use throughout the application
+# Global singleton instance loaded once across the application lifecycle
 settings = Settings()
