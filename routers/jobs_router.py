@@ -1,7 +1,8 @@
 """
 Modular API router for asynchronous Form-C batch extraction jobs.
 Provides non-blocking intake endpoints for multi-document bundles,
-enqueuing background extraction tasks and exposing status polling routes.
+supports granular supplementary document attachments, enqueues
+background extraction tasks upon start trigger, and exposes status polling routes.
 """
 
 import json
@@ -60,24 +61,25 @@ async def save_uploaded_file(upload_file: UploadFile, destination_path: str) -> 
 
 
 # ==============================================================================
-# Job Intake Endpoint (Immediate 202 Accepted)
+# Job Intake Endpoint
 # ==============================================================================
 
 @router.post(
     "/submit",
     response_model=JobSubmissionResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Submit multi-document bundle for asynchronous Form-C processing"
+    summary="Initialize Form-C job and ingest initial passport bio page"
 )
 async def submit_documents_job(
     passport_bio: UploadFile = File(..., description="Passport identity page image containing photo and MRZ lines"),
-    visa_page: Optional[UploadFile] = File(None, description="Image of Indian Visa sticker or OCI document page"),
-    entry_stamp: Optional[UploadFile] = File(None, description="Image of Immigration Arrival / Entry rubber ink stamp"),
-    welcome_form: Optional[UploadFile] = File(None, description="Image of physical handwritten Form-C Arrival Report")
+    visa_page: Optional[UploadFile] = File(None, description="Optional image of Indian Visa sticker or OCI document page"),
+    entry_stamp: Optional[UploadFile] = File(None, description="Optional image of Immigration Arrival rubber ink stamp"),
+    welcome_form: Optional[UploadFile] = File(None, description="Optional image of physical handwritten Form-C Arrival Report"),
+    auto_start: bool = False
 ) -> JobSubmissionResponse:
     """
-    Accepts up to 4 guest document images, stores them on disk, creates a QUEUED database record,
-    pushes the task to the background processing queue, and immediately returns a job tracking ID.
+    Initializes a new job directory, stores the mandatory passport bio page and any bundled documents,
+    creates a QUEUED record in the SQLite database, and optionally enqueues the worker immediately.
     """
     # 1. Generate unique job identifier and dedicated disk directory
     job_id = str(uuid.uuid4())
@@ -93,21 +95,21 @@ async def submit_documents_job(
         await save_uploaded_file(passport_bio, bio_path)
         doc_paths["passport_bio"] = bio_path
 
-        # 3. Persist optional Visa / OCI image if supplied
+        # 3. Persist optional Visa / OCI image if supplied upfront
         if visa_page and visa_page.filename:
             visa_filename = f"visa_{visa_page.filename}"
             visa_path = os.path.join(job_dir, visa_filename)
             await save_uploaded_file(visa_page, visa_path)
             doc_paths["visa_page"] = visa_path
 
-        # 4. Persist optional Entry Stamp image if supplied
+        # 4. Persist optional Entry Stamp image if supplied upfront
         if entry_stamp and entry_stamp.filename:
             stamp_filename = f"stamp_{entry_stamp.filename}"
             stamp_path = os.path.join(job_dir, stamp_filename)
             await save_uploaded_file(entry_stamp, stamp_path)
             doc_paths["entry_stamp"] = stamp_path
 
-        # 5. Persist optional Handwritten Welcome Form image if supplied
+        # 5. Persist optional Handwritten Welcome Form image if supplied upfront
         if welcome_form and welcome_form.filename:
             form_filename = f"form_{welcome_form.filename}"
             form_path = os.path.join(job_dir, form_filename)
@@ -115,7 +117,6 @@ async def submit_documents_job(
             doc_paths["welcome_form"] = form_path
 
     except Exception as exc:
-        # Clean up storage on upload failure
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -125,9 +126,12 @@ async def submit_documents_job(
     # 6. Insert QUEUED entry into SQLite database
     job_meta = create_job(job_id, doc_paths)
 
-    # 7. Push job identifier to the serial background queue
-    await job_queue.put(job_id)
-    logger.info(f"[*] Ingested job {job_id} and queued for processing.")
+    # 7. If auto_start is true (single-request bundle), enqueue right away
+    if auto_start:
+        await job_queue.put(job_id)
+        logger.info(f"[*] Ingested job {job_id} and queued immediately for processing.")
+    else:
+        logger.info(f"[*] Ingested job {job_id}. Awaiting attachments or explicit start trigger.")
 
     return JobSubmissionResponse(
         job_id=job_id,
@@ -137,7 +141,7 @@ async def submit_documents_job(
 
 
 # ==============================================================================
-# Granular Attachment Endpoints (Supports Single-File Mobile Uploaders)
+# Granular Attachment Endpoints
 # ==============================================================================
 
 @router.post(
@@ -188,6 +192,43 @@ async def attach_document_to_job(
 
     logger.info(f"[*] Attached {doc_type} to job {job_id}.")
     return {"status": "success", "job_id": job_id, "attached": doc_type}
+
+
+# ==============================================================================
+# Pipeline Execution Trigger Endpoint
+# ==============================================================================
+
+@router.post(
+    "/{job_id}/start",
+    summary="Trigger background batch extraction after all attachments are uploaded"
+)
+async def start_job_processing(job_id: str):
+    """
+    Pushes the job ID into the sequential background queue once the client finishes
+    uploading all relevant documents.
+    """
+    job_record = get_job(job_id)
+    if not job_record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job with ID '{job_id}' not found."
+        )
+
+    if job_record.get("status") in ["PROCESSING", "COMPLETED"]:
+        return {
+            "status": job_record.get("status"),
+            "message": f"Job {job_id} is already in state {job_record.get('status')}."
+        }
+
+    # Enqueue job to worker
+    await job_queue.put(job_id)
+    logger.info(f"[*] Job {job_id} successfully dispatched to background execution queue.")
+
+    return {
+        "status": "QUEUED",
+        "job_id": job_id,
+        "message": "All attachments received. Background extraction started."
+    }
 
 
 # ==============================================================================
