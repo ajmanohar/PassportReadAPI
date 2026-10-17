@@ -2,6 +2,7 @@
 SQLite persistence repository for asynchronous Form-C processing tasks.
 Provides atomic job creation, status updates, crash recovery reset queries,
 and serialized JSON storage for nested FieldResult extraction structures.
+Ensures that all QUEUED and interrupted PROCESSING jobs are recoverable across reboots.
 """
 
 from datetime import datetime, timezone
@@ -29,7 +30,7 @@ def get_db_connection() -> sqlite3.Connection:
     Creates and returns an active SQLite database connection configured with
     a row factory for column-name dictionary mapping.
 
-    :return: sqlite3.Connection instance.
+    :return: sqlite3.Connection instance with WAL mode enabled.
     """
     # Establish connection with timeout for multi-thread safety
     conn = sqlite3.connect(DB_FILE_PATH, timeout=15.0)
@@ -117,7 +118,7 @@ def create_job(job_id: str, doc_paths: Dict[str, str]) -> Dict[str, Any]:
 
 def update_job_status(job_id: str, new_status: str, error_message: Optional[str] = None) -> None:
     """
-    Updates the lifecycle status of a specific job (e.g., 'PROCESSING', 'FAILED').
+    Updates the lifecycle status of a specific job (e.g., 'PROCESSING', 'FAILED', 'COMPLETED').
 
     :param job_id: Target job UUID.
     :param new_status: New status string matching JobStatus enum.
@@ -252,30 +253,39 @@ def list_recent_jobs(limit: int = 50) -> List[Dict[str, Any]]:
     return results
 
 
-def reset_interrupted_jobs() -> List[str]:
+def get_all_pending_jobs() -> List[str]:
     """
-    Sweeps the database at application startup to identify jobs left stranded in
-    the 'PROCESSING' state due to an unexpected power outage or server reboot.
-    Resets their state back to 'QUEUED' so they can be re-enqueued into the worker.
+    Sweeps the database at application startup:
+    1. Identifies jobs stranded in 'PROCESSING' state due to power outage / reboot
+       and resets their state back to 'QUEUED'.
+    2. Collects all jobs with status 'QUEUED' so they can be re-enqueued into
+       the in-memory asyncio worker queue immediately upon startup.
 
-    :return: List of job IDs that were recovered and reset to 'QUEUED'.
+    :return: Complete list of job IDs awaiting execution.
     """
-    select_query = "SELECT job_id FROM jobs WHERE status = 'PROCESSING';"
     now_iso = datetime.now(timezone.utc).isoformat()
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute(select_query)
-        interrupted_rows = cursor.fetchall()
-        recovered_ids = [r["job_id"] for r in interrupted_rows]
 
-        if recovered_ids:
-            reset_query = """
-            UPDATE jobs
-            SET status = 'QUEUED', updated_at = ?
-            WHERE status = 'PROCESSING';
-            """
-            cursor.execute(reset_query, (now_iso,))
-            conn.commit()
+        # Step 1: Reset interrupted PROCESSING jobs back to QUEUED
+        reset_interrupted_query = """
+        UPDATE jobs
+        SET status = 'QUEUED', updated_at = ?
+        WHERE status = 'PROCESSING';
+        """
+        cursor.execute(reset_interrupted_query, (now_iso,))
+        conn.commit()
 
-    return recovered_ids
+        # Step 2: Fetch all jobs currently in QUEUED status
+        select_queued_query = """
+        SELECT job_id FROM jobs
+        WHERE status = 'QUEUED'
+        ORDER BY created_at ASC;
+        """
+        cursor.execute(select_queued_query)
+        queued_rows = cursor.fetchall()
+        pending_ids = [r["job_id"] for r in queued_rows]
+
+    logger.info(f"[*] Recovered {len(pending_ids)} pending job(s) from SQLite on startup.")
+    return pending_ids
