@@ -3,6 +3,8 @@ Central configuration settings for the PassportReadAPI service.
 Loads runtime parameters from environment variables with sensible production defaults.
 """
 
+import os
+import shutil
 from pydantic_settings import BaseSettings
 from pydantic import Field
 
@@ -10,7 +12,7 @@ from pydantic import Field
 class Settings(BaseSettings):
     """
     Application settings model defining machine learning runtime thresholds,
-    API metadata, and hardware execution configurations.
+    API metadata, hardware execution configurations, and OCR binary paths.
     """
     # API Application Metadata
     api_title: str = Field(
@@ -63,6 +65,16 @@ class Settings(BaseSettings):
         description="Maximum generated tokens allowed per extraction invocation"
     )
 
+    # OCR and External Binary Execution Paths
+    tesseract_cmd: str = Field(
+        default="/usr/bin/tesseract",
+        description="Absolute path to the system tesseract binary for MRZ parsing"
+    )
+    system_path_additions: str = Field(
+        default="/usr/bin:/bin:/usr/local/bin",
+        description="Colon-separated directory paths appended to OS execution PATH"
+    )
+
     class Config:
         # Load environment variables matching case-insensitively
         env_file = ".env"
@@ -72,3 +84,22 @@ class Settings(BaseSettings):
 
 # Global singleton instance consumed across application modules
 settings = Settings()
+
+# Ensure system binary paths are present in runtime os.environ["PATH"]
+# to prevent subprocess lookup failures when executed under minimal systemd environments
+current_path = os.environ.get("PATH", "")
+path_parts = current_path.split(":") if current_path else []
+for directory in settings.system_path_additions.split(":"):
+    if directory and directory not in path_parts:
+        path_parts.append(directory)
+os.environ["PATH"] = ":".join(path_parts)
+
+# Explicitly configure pytesseract binary target if pytesseract is installed in the environment
+try:
+    import pytesseract
+    # Check if configured binary exists; fallback to auto-discovery via which
+    resolved_binary = settings.tesseract_cmd if os.path.exists(settings.tesseract_cmd) else shutil.which("tesseract")
+    if resolved_binary:
+        pytesseract.pytesseract.tesseract_cmd = resolved_binary
+except ImportError:
+    pass
