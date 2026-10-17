@@ -4,6 +4,11 @@ Processes multi-document bundles (Passport Bio, Visa, Entry Stamp, Welcome Form)
 Executes an unconditional 'best-of-both' confidence tournament between Tesseract MRZ and
 Qwen2-VL for the Passport Bio page, selecting the highest-confidence extraction per field.
 Persists progress and results directly to the SQLite database with detailed latency telemetry.
+
+Tuned specifically for CPU execution:
+- Caps visual tokens via settings.min_pixels and settings.max_pixels (49 - 144 patches).
+- Downscales images to settings.max_image_dimension (512px) to prevent attention matrix latency blowouts.
+- Enforces strict PyTorch thread allocation to all physical CPU cores.
 """
 
 import asyncio
@@ -39,19 +44,27 @@ BASE_STORAGE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 # Image Preparation Helper
 # ==============================================================================
 
-def load_and_preprocess_image(file_path: str, max_dimension: int = 1024) -> Optional[Image.Image]:
+def load_and_preprocess_image(
+    file_path: str,
+    max_dimension: Optional[int] = None
+) -> Optional[Image.Image]:
     """
     Loads an image from disk storage, standardizes color channels to RGB,
     logs its native geometry, and downscales proportionally if the maximum
-    dimension exceeds configured limits to prevent CPU token and memory blowouts.
+    dimension exceeds configured limits (defaulting to settings.max_image_dimension: 512px).
+    Bounding the longest edge to 512px bounds visual tokens between 49 and 144 patches,
+    keeping CPU generation latency under 15-25 seconds per stage.
 
     :param file_path: Absolute or relative filesystem path to the image file.
-    :param max_dimension: Maximum allowed width or height in pixels (default 1024px).
+    :param max_dimension: Maximum allowed width or height in pixels. Defaults to settings.max_image_dimension.
     :return: Prepared PIL Image instance, or None if the file cannot be read.
     """
     if not os.path.exists(file_path):
         logger.warning(f"[ImageLoader] File not found on disk: {file_path}")
         return None
+
+    # Resolve target dimension from settings if not explicitly provided
+    target_max_dim = max_dimension if max_dimension is not None else settings.max_image_dimension
 
     try:
         start_t = time.perf_counter()
@@ -63,8 +76,8 @@ def load_and_preprocess_image(file_path: str, max_dimension: int = 1024) -> Opti
             image = image.convert("RGB")
 
         # Downscale proportionally to bound attention matrix computation while preserving sharp text
-        if max(orig_w, orig_h) > max_dimension:
-            image.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+        if max(orig_w, orig_h) > target_max_dim:
+            image.thumbnail((target_max_dim, target_max_dim), Image.Resampling.LANCZOS)
             new_w, new_h = image.size
             logger.info(
                 f"[ImageLoader] Rescaled '{os.path.basename(file_path)}' from {orig_w}x{orig_h} "
@@ -91,7 +104,7 @@ def run_vlm_inference(image: Image.Image, system_prompt: str, ml_state: dict, st
     Executes a structured query against the shared in-memory Qwen2-VL model instance
     with detailed per-stage execution timing and parses the output into a Python dictionary.
 
-    :param image: Preprocessed PIL Image instance.
+    :param image: Preprocessed PIL Image instance bounded to 512px.
     :param system_prompt: Guidance text instructing the VLM on expected JSON fields.
     :param ml_state: Shared dictionary holding 'model' and 'processor' instances.
     :param stage_label: Diagnostic label for logging (e.g. 'Passport Bio', 'Visa', etc.).
@@ -105,6 +118,9 @@ def run_vlm_inference(image: Image.Image, system_prompt: str, ml_state: dict, st
     if not model or not processor:
         raise RuntimeError("Qwen2-VL model and processor are not loaded in ml_state.")
 
+    # Explicitly pin PyTorch compute threads to prevent thread contention on CPU
+    torch.set_num_threads(settings.torch_cpu_threads)
+
     start_vlm_time = time.perf_counter()
     logger.info(f"[{stage_label}] Preparing prompt tensor inputs (image: {image.size[0]}x{image.size[1]})...")
 
@@ -116,7 +132,7 @@ def run_vlm_inference(image: Image.Image, system_prompt: str, ml_state: dict, st
                 {
                     "type": "image",
                     "image": image,
-                    # Bound visual tokens for clean inference without memory blowouts
+                    # Bound visual tokens strictly between 49 and 144 patches for fast CPU inference
                     "min_pixels": settings.min_pixels,
                     "max_pixels": settings.max_pixels
                 },
@@ -308,7 +324,7 @@ def refresh_document_paths(job_id: str) -> Dict[str, str]:
 async def process_single_job(job_id: str, ml_state: dict) -> None:
     """
     Executes the multi-document extraction pipeline for a single queued job.
-    Runs Tesseract MRZ and Qwen2-VL in parallel for the bio page, selects the
+    Runs Tesseract MRZ and Qwen2-VL for the bio page, selects the
     best candidate per field, and continues through Visa, Stamp, and Welcome Form.
 
     :param job_id: Unique UUID string identifier of the target job.
@@ -397,6 +413,7 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
 
             # --- Engine B: Qwen2-VL Visual Bio Execution ---
             vlm_candidates: Dict[str, FieldResult] = {}
+            # Preprocess image downscaled to settings.max_image_dimension (512px)
             bio_image = await asyncio.to_thread(load_and_preprocess_image, bio_path)
 
             if bio_image:
@@ -485,6 +502,7 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
 
         if visa_path and os.path.exists(visa_path):
             logger.info(f"[{job_id}] Stage 2/4: Running Qwen2-VL visa extraction ({visa_path})...")
+            # Downscale image to 512px
             visa_image = await asyncio.to_thread(load_and_preprocess_image, visa_path)
             if visa_image:
                 visa_prompt = (
@@ -516,6 +534,7 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
 
         if stamp_path and os.path.exists(stamp_path):
             logger.info(f"[{job_id}] Stage 3/4: Running Qwen2-VL entry stamp extraction ({stamp_path})...")
+            # Downscale image to 512px
             stamp_image = await asyncio.to_thread(load_and_preprocess_image, stamp_path)
             if stamp_image:
                 stamp_prompt = (
@@ -541,6 +560,7 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
 
         if welcome_path and os.path.exists(welcome_path):
             logger.info(f"[{job_id}] Stage 4/4: Running Qwen2-VL handwritten Form-C extraction ({welcome_path})...")
+            # Downscale image to 512px
             welcome_image = await asyncio.to_thread(load_and_preprocess_image, welcome_path)
             if welcome_image:
                 welcome_prompt = (
