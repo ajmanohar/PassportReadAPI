@@ -11,6 +11,7 @@ Tuned specifically for CPU execution:
 - Downscales images to settings.max_image_dimension (512px) to prevent attention matrix latency blowouts.
 - Enforces strict PyTorch thread allocation to all physical CPU cores.
 - Emits real-time intermediate state to SQLite so mobile dashboard pills turn green progressively.
+- Features explicit row-anchor visual prompting matching Form C (Rule 14) table structure.
 """
 
 import asyncio
@@ -582,28 +583,43 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
             # Downscale image to 512px
             welcome_image = await asyncio.to_thread(load_and_preprocess_image, welcome_path)
             if welcome_image:
+                # Targeted prompt structured exactly around the 12 numbered rows of FORM C (RULE 14)
                 welcome_prompt = (
-                    "Carefully read the handwritten ARRIVAL REPORT (THE REGISTRATION OF FOREIGNERS RULES 1939 FORM C RULE 14) "
-                    "document image. Extract every numbered item accurately. "
-                    "For each field, return a JSON object with 'value' and 'confidence' (0.0 - 1.0).\n"
-                    "Required JSON format:\n"
+                    "This image is a printed ARRIVAL REPORT table (THE REGISTRATION OF FOREIGNERS RULES 1939 FORM C RULE 14) "
+                    "containing handwritten guest entries. "
+                    "Locate each numbered row and transcribe the text entered to the right or below each printed label:\n"
+                    "Row 1: 'Name of foreigner (Surname First)'\n"
+                    "Row 2: 'Full Address' (permanent home street address), with sub-labels: 'City', 'Country', 'E-mail', and 'Telphone / Mobile'\n"
+                    "Row 3: 'Nationality'\n"
+                    "Row 4: 'Place of issue of visa'\n"
+                    "Row 5: 'Date of Arrival in India' (YYYY-MM-DD or as written)\n"
+                    "Row 6: 'Date and Time of Arrival in the home stay'\n"
+                    "Row 7: 'Arrived from'\n"
+                    "Row 8: 'Proceeding to (from here)'\n"
+                    "Row 9: 'Proposed duration of stay in India'\n"
+                    "Row 10: 'Purpose of visit & your Profession'\n"
+                    "Row 11: 'Expected date of departure (from here)'\n"
+                    "Row 12: 'Country & city you arrived to India'\n\n"
+                    "If a line is blank or not legible, use null for value and 0.0 for confidence. "
+                    "If handwriting or text is present, extract it and assign a confidence between 0.50 and 1.0.\n"
+                    "Return ONLY valid JSON matching this exact structure:\n"
                     "{\n"
-                    '  "name_of_foreigner": {"value": "...", "confidence": 0.85},\n'
-                    '  "full_address": {"value": "...", "confidence": 0.80},\n'
-                    '  "city": {"value": "...", "confidence": 0.80},\n'
-                    '  "country": {"value": "...", "confidence": 0.80},\n'
-                    '  "email": {"value": "...", "confidence": 0.85},\n'
-                    '  "telephone_mobile": {"value": "...", "confidence": 0.85},\n'
-                    '  "nationality": {"value": "...", "confidence": 0.80},\n'
-                    '  "place_of_issue_of_visa": {"value": "...", "confidence": 0.80},\n'
-                    '  "date_of_arrival_in_india": {"value": "YYYY-MM-DD", "confidence": 0.80},\n'
-                    '  "datetime_arrival_homestay": {"value": "...", "confidence": 0.80},\n'
-                    '  "arrived_from": {"value": "...", "confidence": 0.80},\n'
-                    '  "proceeding_to": {"value": "...", "confidence": 0.80},\n'
-                    '  "proposed_duration_stay_india": {"value": "...", "confidence": 0.80},\n'
-                    '  "purpose_of_visit_profession": {"value": "...", "confidence": 0.80},\n'
-                    '  "expected_date_departure": {"value": "YYYY-MM-DD", "confidence": 0.80},\n'
-                    '  "country_city_arrived_to_india": {"value": "...", "confidence": 0.80}\n'
+                    '  "name_of_foreigner": {"value": null, "confidence": 0.0},\n'
+                    '  "full_address": {"value": null, "confidence": 0.0},\n'
+                    '  "city": {"value": null, "confidence": 0.0},\n'
+                    '  "country": {"value": null, "confidence": 0.0},\n'
+                    '  "email": {"value": null, "confidence": 0.0},\n'
+                    '  "telephone_mobile": {"value": null, "confidence": 0.0},\n'
+                    '  "nationality": {"value": null, "confidence": 0.0},\n'
+                    '  "place_of_issue_of_visa": {"value": null, "confidence": 0.0},\n'
+                    '  "date_of_arrival_in_india": {"value": null, "confidence": 0.0},\n'
+                    '  "datetime_arrival_homestay": {"value": null, "confidence": 0.0},\n'
+                    '  "arrived_from": {"value": null, "confidence": 0.0},\n'
+                    '  "proceeding_to": {"value": null, "confidence": 0.0},\n'
+                    '  "proposed_duration_stay_india": {"value": null, "confidence": 0.0},\n'
+                    '  "purpose_of_visit_profession": {"value": null, "confidence": 0.0},\n'
+                    '  "expected_date_departure": {"value": null, "confidence": 0.0},\n'
+                    '  "country_city_arrived_to_india": {"value": null, "confidence": 0.0}\n'
                     "}"
                 )
                 vlm_form = await asyncio.to_thread(run_vlm_inference, welcome_image, welcome_prompt, ml_state, "Welcome Form VLM")
