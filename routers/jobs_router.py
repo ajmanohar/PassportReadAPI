@@ -1,8 +1,8 @@
 """
 Modular API router for asynchronous Form-C batch extraction jobs.
 Provides non-blocking intake endpoints for multi-document bundles,
-supports granular supplementary document attachments, enqueues
-background extraction tasks upon start trigger, and exposes status polling routes.
+supports granular supplementary document attachments, automatic background
+worker dispatching, and diagnostic polling routes.
 """
 
 import json
@@ -74,12 +74,12 @@ async def submit_documents_job(
     passport_bio: UploadFile = File(..., description="Passport identity page image containing photo and MRZ lines"),
     visa_page: Optional[UploadFile] = File(None, description="Optional image of Indian Visa sticker or OCI document page"),
     entry_stamp: Optional[UploadFile] = File(None, description="Optional image of Immigration Arrival rubber ink stamp"),
-    welcome_form: Optional[UploadFile] = File(None, description="Optional image of physical handwritten Form-C Arrival Report"),
-    auto_start: bool = False
+    welcome_form: Optional[UploadFile] = File(None, description="Optional image of physical handwritten Form-C Arrival Report")
 ) -> JobSubmissionResponse:
     """
     Initializes a new job directory, stores the mandatory passport bio page and any bundled documents,
-    creates a QUEUED record in the SQLite database, and optionally enqueues the worker immediately.
+    creates a QUEUED record in the SQLite database, and immediately enqueues the worker.
+    The worker dynamically checks disk for secondary documents before processing them.
     """
     # 1. Generate unique job identifier and dedicated disk directory
     job_id = str(uuid.uuid4())
@@ -126,12 +126,9 @@ async def submit_documents_job(
     # 6. Insert QUEUED entry into SQLite database
     job_meta = create_job(job_id, doc_paths)
 
-    # 7. If auto_start is true (single-request bundle), enqueue right away
-    if auto_start:
-        await job_queue.put(job_id)
-        logger.info(f"[*] Ingested job {job_id} and queued immediately for processing.")
-    else:
-        logger.info(f"[*] Ingested job {job_id}. Awaiting attachments or explicit start trigger.")
+    # 7. Enqueue directly into background worker
+    await job_queue.put(job_id)
+    logger.info(f"[*] Ingested job {job_id} and dispatched to processing queue immediately.")
 
     return JobSubmissionResponse(
         job_id=job_id,
@@ -190,22 +187,21 @@ async def attach_document_to_job(
         )
         conn.commit()
 
-    logger.info(f"[*] Attached {doc_type} to job {job_id}.")
+    logger.info(f"[*] Attached {doc_type} to job {job_id} (path: {dest_path}).")
     return {"status": "success", "job_id": job_id, "attached": doc_type}
 
 
 # ==============================================================================
-# Pipeline Execution Trigger Endpoint
+# Pipeline Execution Trigger Endpoint (Fallback)
 # ==============================================================================
 
 @router.post(
     "/{job_id}/start",
-    summary="Trigger background batch extraction after all attachments are uploaded"
+    summary="Ensure background batch extraction is queued"
 )
 async def start_job_processing(job_id: str):
     """
-    Pushes the job ID into the sequential background queue once the client finishes
-    uploading all relevant documents.
+    Pushes the job ID into the sequential background queue if not already processing.
     """
     job_record = get_job(job_id)
     if not job_record:
@@ -214,20 +210,20 @@ async def start_job_processing(job_id: str):
             detail=f"Job with ID '{job_id}' not found."
         )
 
-    if job_record.get("status") in ["PROCESSING", "COMPLETED"]:
+    current_status = job_record.get("status")
+    if current_status in ["PROCESSING", "COMPLETED"]:
         return {
-            "status": job_record.get("status"),
-            "message": f"Job {job_id} is already in state {job_record.get('status')}."
+            "status": current_status,
+            "message": f"Job {job_id} is already in state {current_status}."
         }
 
-    # Enqueue job to worker
     await job_queue.put(job_id)
-    logger.info(f"[*] Job {job_id} successfully dispatched to background execution queue.")
+    logger.info(f"[*] Job {job_id} explicitly dispatched to background execution queue.")
 
     return {
         "status": "QUEUED",
         "job_id": job_id,
-        "message": "All attachments received. Background extraction started."
+        "message": "Job dispatched to background extraction queue."
     }
 
 
