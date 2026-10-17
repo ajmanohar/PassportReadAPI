@@ -3,12 +3,14 @@ Background batch execution pipeline and serial queue worker for asynchronous For
 Processes multi-document bundles (Passport Bio, Visa, Entry Stamp, Welcome Form) sequentially.
 Executes an unconditional 'best-of-both' confidence tournament between Tesseract MRZ and
 Qwen2-VL for the Passport Bio page, selecting the highest-confidence extraction per field.
-Persists progress and results directly to the SQLite database with detailed latency telemetry.
+Persists progress and results directly to the SQLite database with detailed latency telemetry
+and progressive intermediate updates after each stage.
 
 Tuned specifically for CPU execution:
 - Caps visual tokens via settings.min_pixels and settings.max_pixels (49 - 144 patches).
 - Downscales images to settings.max_image_dimension (512px) to prevent attention matrix latency blowouts.
 - Enforces strict PyTorch thread allocation to all physical CPU cores.
+- Emits real-time intermediate state to SQLite so mobile dashboard pills turn green progressively.
 """
 
 import asyncio
@@ -26,7 +28,7 @@ from passporteye import read_mrz
 
 # Central configuration and repository imports
 from config import settings
-from storage.db import update_job_status, save_job_result, get_job
+from storage.db import update_job_status, save_intermediate_job_result, save_job_result, get_job
 from schemas.job import GuestFormCRecord, FieldResult
 
 # Set up module-level logger
@@ -326,6 +328,8 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
     Executes the multi-document extraction pipeline for a single queued job.
     Runs Tesseract MRZ and Qwen2-VL for the bio page, selects the
     best candidate per field, and continues through Visa, Stamp, and Welcome Form.
+    Progressively persists extraction state to SQLite after each stage so mobile
+    clients receive real-time updates as stages complete.
 
     :param job_id: Unique UUID string identifier of the target job.
     :param ml_state: Shared dictionary holding model handles.
@@ -490,6 +494,11 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                 vlm_candidates.get("passport_expiry_date", empty_field),
                 processing_notes
             )
+
+            # Persist Stage 1 intermediate progress to SQLite immediately
+            fused_record.processing_notes = list(processing_notes)
+            save_intermediate_job_result(job_id, fused_record.model_dump())
+            logger.info(f"[{job_id}] Stage 1/4 completed and intermediate state persisted to database.")
         else:
             logger.warning(f"[{job_id}] Passport bio image not found on disk: {bio_path}")
             processing_notes.append("Passport bio image missing from job directory.")
@@ -523,6 +532,11 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                 fused_record.visa_expiry_date = normalize_vlm_field(vlm_visa.get("expiry_date"))
                 fused_record.visa_place_of_issue = normalize_vlm_field(vlm_visa.get("place_of_issue"))
                 processing_notes.append("Visa / OCI details extracted via Qwen2-VL.")
+
+                # Persist Stage 2 intermediate progress to SQLite immediately
+                fused_record.processing_notes = list(processing_notes)
+                save_intermediate_job_result(job_id, fused_record.model_dump())
+                logger.info(f"[{job_id}] Stage 2/4 completed and intermediate state persisted to database.")
         else:
             logger.info(f"[{job_id}] Stage 2/4: No visa_page document attached to job. Skipping.")
 
@@ -549,6 +563,11 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                 fused_record.arrival_date_india = normalize_vlm_field(vlm_stamp.get("arrival_date"))
                 fused_record.arrival_port_india = normalize_vlm_field(vlm_stamp.get("arrival_port"))
                 processing_notes.append("Entry stamp details extracted via Qwen2-VL.")
+
+                # Persist Stage 3 intermediate progress to SQLite immediately
+                fused_record.processing_notes = list(processing_notes)
+                save_intermediate_job_result(job_id, fused_record.model_dump())
+                logger.info(f"[{job_id}] Stage 3/4 completed and intermediate state persisted to database.")
         else:
             logger.info(f"[{job_id}] Stage 3/4: No entry_stamp document attached to job. Skipping.")
 
@@ -620,6 +639,7 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
         processing_notes.append(f"Complete pipeline executed in {total_job_duration:.2f}s.")
         fused_record.processing_notes = processing_notes
 
+        # Transition status to COMPLETED and commit final result
         save_job_result(job_id, fused_record.model_dump())
         logger.info(f"[+] Job {job_id} successfully completed in {total_job_duration:.2f}s.")
 
