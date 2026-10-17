@@ -1,24 +1,25 @@
 """
-SQLite persistence repository for asynchronous Form-C processing tasks.
-Provides atomic job creation, status updates, crash recovery reset queries,
-and serialized JSON storage for nested FieldResult extraction structures.
-Ensures that all QUEUED and interrupted PROCESSING jobs are recoverable across reboots.
+SQLite database storage layer for PassportReadAPI.
+Manages schema initialization, job lifecycle state transitions, document path manifests,
+and progressive intermediate extraction persistence for asynchronous batch jobs.
 """
 
-from datetime import datetime, timezone
 import json
 import logging
 import os
 import sqlite3
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional, List
 
-# Set up module-level logger
+# Central configuration settings
+from config import settings
+
+# Configure module-level logger
 logger = logging.getLogger("storage.db")
 logger.setLevel(logging.INFO)
 
-# Define filesystem path for SQLite database file
-STORAGE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_FILE_PATH = os.path.join(STORAGE_DIR, "jobs.db")
+# Absolute path for the SQLite database file on disk
+STORAGE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "storage")
+DB_PATH = os.path.join(STORAGE_DIR, "jobs.db")
 
 
 # ==============================================================================
@@ -27,265 +28,219 @@ DB_FILE_PATH = os.path.join(STORAGE_DIR, "jobs.db")
 
 def get_db_connection() -> sqlite3.Connection:
     """
-    Creates and returns an active SQLite database connection configured with
-    a row factory for column-name dictionary mapping.
-
-    :return: sqlite3.Connection instance with WAL mode enabled.
+    Creates and returns a SQLite database connection configured with
+    row factory for dictionary-like column access and immediate timeout.
     """
-    # Establish connection with timeout for multi-thread safety
-    conn = sqlite3.connect(DB_FILE_PATH, timeout=15.0)
-
-    # Enable column access by dictionary key
+    os.makedirs(STORAGE_DIR, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
-
-    # Enforce Write-Ahead Logging (WAL) mode for concurrent read-write performance
-    conn.execute("PRAGMA journal_mode=WAL;")
-
     return conn
 
 
 # ==============================================================================
-# Schema Initialization
+# Database Schema Initialization
 # ==============================================================================
 
-def initialize_database() -> None:
+def init_db() -> None:
     """
+    Initializes the SQLite schema for tracking batch extraction jobs.
     Creates the 'jobs' table and indexes if they do not already exist.
-    Stores metadata, filesystem paths, lifecycle status, and the JSON extraction result.
     """
-    logger.info(f"[*] Initializing SQLite database schema at: {DB_FILE_PATH}")
-
-    create_table_query = """
-    CREATE TABLE IF NOT EXISTS jobs (
-        job_id TEXT PRIMARY KEY,
-        status TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        doc_paths_json TEXT NOT NULL,
-        result_json TEXT,
-        error_message TEXT
-    );
-    """
-
-    create_index_query = """
-    CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-    """
-
+    logger.info(f"[*] Initializing SQLite database schema at: {DB_PATH}")
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute(create_table_query)
-        cursor.execute(create_index_query)
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                doc_paths_json TEXT NOT NULL,
+                result_json TEXT,
+                error_message TEXT
+            );
+            """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_jobs_status_created 
+            ON jobs(status, created_at DESC);
+            """
+        )
         conn.commit()
-
     logger.info("[*] SQLite database schema initialized successfully.")
 
 
 # ==============================================================================
-# Job Management Operations
+# Job Lifecycle Management Functions
 # ==============================================================================
 
 def create_job(job_id: str, doc_paths: Dict[str, str]) -> Dict[str, Any]:
     """
-    Inserts a newly ingested document bundle record into the database with initial state 'QUEUED'.
+    Inserts a newly ingested job with initial status 'QUEUED' and serializes
+    the initial document paths manifest.
 
-    :param job_id: Unique UUID string identifier.
-    :param doc_paths: Dictionary mapping document types ('passport_bio', etc.) to disk paths.
-    :return: Dictionary containing initialized job metadata.
+    :param job_id: Unique UUID identifier string for the job.
+    :param doc_paths: Dictionary mapping document keys ('passport_bio', etc.) to disk paths.
+    :return: Dictionary representation of the created job record.
     """
-    now_iso = datetime.now(timezone.utc).isoformat()
-    paths_serialized = json.dumps(doc_paths)
-
-    insert_query = """
-    INSERT INTO jobs (job_id, status, created_at, updated_at, doc_paths_json, result_json, error_message)
-    VALUES (?, 'QUEUED', ?, ?, ?, NULL, NULL);
-    """
-
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute(insert_query, (job_id, now_iso, now_iso, paths_serialized))
+        paths_json = json.dumps(doc_paths)
+        cursor.execute(
+            """
+            INSERT INTO jobs (job_id, status, doc_paths_json, created_at, updated_at)
+            VALUES (?, 'QUEUED', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+            """,
+            (job_id, paths_json)
+        )
         conn.commit()
+        logger.info(f"[*] Created QUEUED database record for job: {job_id}")
 
-    logger.info(f"[*] Created QUEUED database record for job: {job_id}")
-
-    return {
-        "job_id": job_id,
-        "status": "QUEUED",
-        "created_at": now_iso,
-        "updated_at": now_iso,
-        "doc_paths": doc_paths
-    }
+    return get_job(job_id)
 
 
 def update_job_status(job_id: str, new_status: str, error_message: Optional[str] = None) -> None:
     """
-    Updates the lifecycle status of a specific job (e.g., 'PROCESSING', 'FAILED', 'COMPLETED').
+    Updates the execution state of an existing job (e.g., 'PROCESSING', 'FAILED').
 
-    :param job_id: Target job UUID.
-    :param new_status: New status string matching JobStatus enum.
-    :param error_message: Optional error details if status transition is FAILED.
+    :param job_id: Unique job identifier string.
+    :param new_status: Target status string ('QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED').
+    :param error_message: Optional error diagnostics if transitioning to 'FAILED'.
     """
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    update_query = """
-    UPDATE jobs
-    SET status = ?, updated_at = ?, error_message = ?
-    WHERE job_id = ?;
-    """
-
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute(update_query, (new_status, now_iso, error_message, job_id))
+        cursor.execute(
+            """
+            UPDATE jobs
+            SET status = ?,
+                updated_at = CURRENT_TIMESTAMP,
+                error_message = ?
+            WHERE job_id = ?;
+            """,
+            (new_status, error_message, job_id)
+        )
         conn.commit()
+        logger.info(f"[*] Job {job_id} transitioned status -> {new_status}")
 
-    logger.info(f"[*] Job {job_id} transitioned status -> {new_status}")
+
+def save_intermediate_job_result(job_id: str, result_dict: Dict[str, Any]) -> None:
+    """
+    Progressively persists partial extraction results into SQLite while keeping
+    status as 'PROCESSING'. This enables real-time polling by mobile clients so
+    individual stage badges can turn green before all 4 stages finish.
+
+    :param job_id: Unique job identifier string.
+    :param result_dict: Serialized dictionary of the current GuestFormCRecord model.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        serialized_result = json.dumps(result_dict)
+        cursor.execute(
+            """
+            UPDATE jobs
+            SET result_json = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE job_id = ?;
+            """,
+            (serialized_result, job_id)
+        )
+        conn.commit()
+        logger.info(f"[*] Saved progressive intermediate results to SQLite for job: {job_id}")
 
 
 def save_job_result(job_id: str, result_dict: Dict[str, Any]) -> None:
     """
-    Persists the final completed extraction dictionary into 'result_json' and
-    marks the job status as 'COMPLETED'.
+    Persists the final completed Form-C fused record and transitions status to 'COMPLETED'.
 
-    :param job_id: Target job UUID.
-    :param result_dict: Dictionary representation of the fused GuestFormCRecord.
+    :param job_id: Unique job identifier string.
+    :param result_dict: Serialized dictionary of the full GuestFormCRecord model.
     """
-    now_iso = datetime.now(timezone.utc).isoformat()
-    serialized_result = json.dumps(result_dict)
-
-    complete_query = """
-    UPDATE jobs
-    SET status = 'COMPLETED', updated_at = ?, result_json = ?, error_message = NULL
-    WHERE job_id = ?;
-    """
-
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute(complete_query, (now_iso, serialized_result, job_id))
+        serialized_result = json.dumps(result_dict)
+        cursor.execute(
+            """
+            UPDATE jobs
+            SET status = 'COMPLETED',
+                result_json = ?,
+                updated_at = CURRENT_TIMESTAMP,
+                error_message = NULL
+            WHERE job_id = ?;
+            """,
+            (serialized_result, job_id)
+        )
         conn.commit()
+        logger.info(f"[+] Persisted final extraction result for job: {job_id}")
 
-    logger.info(f"[+] Persisted final extraction result for job: {job_id}")
 
+# ==============================================================================
+# Job Querying & Retrieval Functions
+# ==============================================================================
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     """
-    Retrieves full record for a specific job, deserializing JSON fields into Python dictionaries.
+    Retrieves a single job row by ID and deserializes JSON manifests into Python structures.
 
-    :param job_id: Unique UUID string identifier.
-    :return: Job record dictionary or None if not found.
+    :param job_id: Target UUID string.
+    :return: Dictionary representation of the job, or None if not found.
     """
-    select_query = """
-    SELECT job_id, status, created_at, updated_at, doc_paths_json, result_json, error_message
-    FROM jobs
-    WHERE job_id = ?;
-    """
-
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute(select_query, (job_id,))
+        cursor.execute(
+            """
+            SELECT job_id, status, created_at, updated_at, doc_paths_json, result_json, error_message
+            FROM jobs
+            WHERE job_id = ?;
+            """,
+            (job_id,)
+        )
         row = cursor.fetchone()
 
     if not row:
         return None
-
-    # Safely deserialize stored doc paths
-    try:
-        doc_paths = json.loads(row["doc_paths_json"]) if row["doc_paths_json"] else {}
-    except (ValueError, TypeError):
-        doc_paths = {}
-
-    # Safely deserialize fused result JSON
-    try:
-        result = json.loads(row["result_json"]) if row["result_json"] else None
-    except (ValueError, TypeError):
-        result = None
 
     return {
         "job_id": row["job_id"],
         "status": row["status"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
-        "doc_paths": doc_paths,
-        "result": result,
+        "doc_paths": json.loads(row["doc_paths_json"]) if row["doc_paths_json"] else {},
+        "result": json.loads(row["result_json"]) if row["result_json"] else None,
         "error_message": row["error_message"]
     }
 
 
 def list_recent_jobs(limit: int = 50) -> List[Dict[str, Any]]:
     """
-    Retrieves recent jobs ordered by creation timestamp descending for Android Room sync.
+    Retrieves the most recent jobs ordered by creation timestamp descending.
 
-    :param limit: Maximum number of rows to retrieve.
+    :param limit: Maximum number of rows to return (default 50).
     :return: List of job record dictionaries.
     """
-    select_recent_query = """
-    SELECT job_id, status, created_at, updated_at, doc_paths_json, result_json, error_message
-    FROM jobs
-    ORDER BY created_at DESC
-    LIMIT ?;
-    """
-
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute(select_recent_query, (limit,))
+        cursor.execute(
+            """
+            SELECT job_id, status, created_at, updated_at, doc_paths_json, result_json, error_message
+            FROM jobs
+            ORDER BY created_at DESC
+            LIMIT ?;
+            """,
+            (limit,)
+        )
         rows = cursor.fetchall()
 
     results = []
-    for r in rows:
-        try:
-            paths = json.loads(r["doc_paths_json"]) if r["doc_paths_json"] else {}
-        except Exception:
-            paths = {}
-
-        try:
-            res_dict = json.loads(r["result_json"]) if r["result_json"] else None
-        except Exception:
-            res_dict = None
-
+    for row in rows:
         results.append({
-            "job_id": r["job_id"],
-            "status": r["status"],
-            "created_at": r["created_at"],
-            "updated_at": r["updated_at"],
-            "doc_paths": paths,
-            "result": res_dict,
-            "error_message": r["error_message"]
+            "job_id": row["job_id"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "doc_paths": json.loads(row["doc_paths_json"]) if row["doc_paths_json"] else {},
+            "result": json.loads(row["result_json"]) if row["result_json"] else None,
+            "error_message": row["error_message"]
         })
-
     return results
-
-
-def get_all_pending_jobs() -> List[str]:
-    """
-    Sweeps the database at application startup:
-    1. Identifies jobs stranded in 'PROCESSING' state due to power outage / reboot
-       and resets their state back to 'QUEUED'.
-    2. Collects all jobs with status 'QUEUED' so they can be re-enqueued into
-       the in-memory asyncio worker queue immediately upon startup.
-
-    :return: Complete list of job IDs awaiting execution.
-    """
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-
-        # Step 1: Reset interrupted PROCESSING jobs back to QUEUED
-        reset_interrupted_query = """
-        UPDATE jobs
-        SET status = 'QUEUED', updated_at = ?
-        WHERE status = 'PROCESSING';
-        """
-        cursor.execute(reset_interrupted_query, (now_iso,))
-        conn.commit()
-
-        # Step 2: Fetch all jobs currently in QUEUED status
-        select_queued_query = """
-        SELECT job_id FROM jobs
-        WHERE status = 'QUEUED'
-        ORDER BY created_at ASC;
-        """
-        cursor.execute(select_queued_query)
-        queued_rows = cursor.fetchall()
-        pending_ids = [r["job_id"] for r in queued_rows]
-
-    logger.info(f"[*] Recovered {len(pending_ids)} pending job(s) from SQLite on startup.")
-    return pending_ids
