@@ -1,6 +1,7 @@
 """
 Central configuration settings for the PassportReadAPI service.
 Loads runtime parameters from environment variables with sensible production defaults.
+Configured specifically for low-latency multithreaded CPU inference on Intel edge hardware.
 """
 
 import os
@@ -14,7 +15,9 @@ class Settings(BaseSettings):
     Application settings model defining machine learning runtime thresholds,
     API metadata, hardware execution configurations, and OCR binary paths.
     """
+    # -------------------------------------------------------------------------
     # API Application Metadata
+    # -------------------------------------------------------------------------
     api_title: str = Field(
         default="Passport and Visa OCR Extraction API",
         description="Public display name for OpenAPI docs and health diagnostic reports"
@@ -31,41 +34,63 @@ class Settings(BaseSettings):
         description="Extended documentation narrative"
     )
 
-    # Hugging Face Vision-Language Model identifier
+    # -------------------------------------------------------------------------
+    # Hugging Face Vision-Language Model Identifier
+    # -------------------------------------------------------------------------
     model_id: str = Field(
         default="Qwen/Qwen2-VL-2B-Instruct",
         description="Hugging Face repo or local path for Qwen2-VL vision weights"
     )
 
-    # Execution hardware device target ('cpu', 'cuda', or 'mps')
+    # -------------------------------------------------------------------------
+    # Execution Hardware Device Target ('cpu', 'cuda', or 'mps')
+    # -------------------------------------------------------------------------
     device: str = Field(
         default="cpu",
         description="Target compute backend for PyTorch tensor execution"
     )
 
-    # PyTorch CPU compute thread pinning (0 uses system default)
+    # -------------------------------------------------------------------------
+    # PyTorch CPU Compute Thread Pinning
+    # -------------------------------------------------------------------------
     torch_cpu_threads: int = Field(
         default=4,
         description="Number of CPU threads pinned to PyTorch operations to prevent thermal throttling"
     )
 
-    # Vision processor input token bounding constraints
+    # -------------------------------------------------------------------------
+    # Image Rescaling & Visual Token Bounding Constraints (CPU Latency Tuning)
+    # -------------------------------------------------------------------------
+    # Caps the longest image edge before patching to keep attention matrix lightweight
+    max_image_dimension: int = Field(
+        default=512,
+        description="Maximum image width or height in pixels prior to vision model tokenization"
+    )
+
+    # Vision processor input token bounding constraints:
+    # 49 patches = 49 * 28 * 28 = 38,416 pixels (minimum resolution)
+    # 144 patches = 144 * 28 * 28 = 112,896 pixels (maximum resolution)
+    # Bounding visual tokens between 49 and 144 reduces CPU token attention time from ~5m to ~15-25s.
     min_pixels: int = Field(
-        default=256 * 28 * 28,
+        default=49 * 28 * 28,
         description="Minimum visual token resolution boundary for image patching"
     )
     max_pixels: int = Field(
-        default=1280 * 28 * 28,
-        description="Maximum visual token resolution boundary for memory control"
+        default=144 * 28 * 28,
+        description="Maximum visual token resolution boundary for CPU memory and attention control"
     )
 
-    # Generation decoding budget
+    # -------------------------------------------------------------------------
+    # Generation Decoding Budget
+    # -------------------------------------------------------------------------
     max_new_tokens: int = Field(
-        default=512,
+        default=256,
         description="Maximum generated tokens allowed per extraction invocation"
     )
 
+    # -------------------------------------------------------------------------
     # OCR and External Binary Execution Paths
+    # -------------------------------------------------------------------------
     tesseract_cmd: str = Field(
         default="/usr/bin/tesseract",
         description="Absolute path to the system tesseract binary for MRZ parsing"
