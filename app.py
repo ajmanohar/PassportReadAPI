@@ -26,7 +26,7 @@ from routers.mrz_router import router as mrz_router
 from routers.jobs_router import router as jobs_router
 
 # Database persistence and async background queue worker
-from storage.db import initialize_database, reset_interrupted_jobs
+from storage.db import initialize_database, get_all_pending_jobs
 from services.job_worker import background_queue_worker, job_queue
 
 # Standardized schema models
@@ -54,7 +54,7 @@ async def lifespan(app: FastAPI):
     1. Loads Qwen2-VL model and processor into RAM.
     2. Configures PyTorch compute thread pinning for CPU.
     3. Initializes the SQLite jobs database table.
-    4. Recovers interrupted jobs after system reboot.
+    4. Recovers all pending and interrupted jobs from SQLite and enqueues them.
     5. Starts the background queue worker task.
     6. Cancels background tasks on shutdown.
     """
@@ -94,14 +94,14 @@ async def lifespan(app: FastAPI):
         logger.error(f"[!] Critical failure loading model '{settings.model_id}': {exc}")
         raise exc
 
-    # 1. Initialize SQLite jobs table
+    # 1. Initialize SQLite jobs table schema
     initialize_database()
 
-    # 2. Crash recovery: re-queue any jobs interrupted mid-processing during power loss
-    interrupted_job_ids = reset_interrupted_jobs()
-    if interrupted_job_ids:
-        logger.info(f"[*] Recovered {len(interrupted_job_ids)} interrupted job(s). Re-queuing...")
-        for j_id in interrupted_job_ids:
+    # 2. Crash & reboot recovery: fetch all QUEUED or interrupted PROCESSING jobs
+    pending_job_ids = get_all_pending_jobs()
+    if pending_job_ids:
+        logger.info(f"[*] Enqueuing {len(pending_job_ids)} pending job(s) into background queue...")
+        for j_id in pending_job_ids:
             await job_queue.put(j_id)
 
     # 3. Start background queue worker as a persistent asyncio background task
@@ -236,12 +236,11 @@ def execute_vlm_query(image: Image.Image, system_prompt: str) -> dict:
 
 def parse_vlm_field_entry(raw_container: dict, field_name: str, default_score: float = 0.80) -> FieldResult:
     """
-    Extracts an individual field from a VLM response dictionary, handling both
-    nested format ({field: {value: ..., confidence: ...}}) and flat formats.
+    Extracts an individual field from a VLM response dictionary.
     """
     entry = raw_container.get(field_name)
 
-    if entry is None or str(entry).strip().lower() in ["null", "none", ""]:
+    if entry is None or str(entry).strip().lower() in ["null", "none", "", "n/a", "unknown"]:
         return FieldResult(value=None, confidence=0.0, source="qwen2_vl")
 
     if isinstance(entry, dict):
@@ -251,7 +250,7 @@ def parse_vlm_field_entry(raw_container: dict, field_name: str, default_score: f
         val = str(entry)
         raw_conf = raw_container.get(f"{field_name}_confidence", default_score)
 
-    if not val or str(val).strip().lower() in ["null", "none", ""]:
+    if not val or str(val).strip().lower() in ["null", "none", "", "n/a", "unknown"]:
         return FieldResult(value=None, confidence=0.0, source="qwen2_vl")
 
     try:
@@ -279,8 +278,7 @@ def parse_vlm_field_entry(raw_container: dict, field_name: str, default_score: f
 )
 async def extract_passport_bio(file: UploadFile = File(...)) -> PassportBioResponse:
     """
-    Extracts passport bio-data fields along with individual visual confidence scores
-    rated from 0.0 (uncertain/blurred) to 1.0 (clear).
+    Extracts passport bio-data fields along with individual visual confidence scores.
     """
     image_bytes = await file.read()
     image = validate_and_load_image(image_bytes)
@@ -337,8 +335,7 @@ async def extract_visa_details(file: UploadFile = File(...)) -> VisaResponse:
         '  "visa_type": {"value": "...", "confidence": 0.90},\n'
         '  "issue_date": {"value": "YYYY-MM-DD", "confidence": 0.85},\n'
         '  "expiry_date": {"value": "YYYY-MM-DD", "confidence": 0.85},\n'
-        '  "place_of_issue": {"value": "...", "confidence": 0.85},\n'
-        '  "confidence_note": "short explanation of image quality"\n'
+        '  "place_of_issue": {"value": "...", "confidence": 0.85}\n'
         "}"
     )
 
@@ -373,7 +370,7 @@ async def extract_stamp_details(file: UploadFile = File(...)) -> StampResponse:
         "Output JSON formatted exactly as:\n"
         "{\n"
         '  "arrival_date": {"value": "YYYY-MM-DD", "confidence": 0.85},\n'
-        '  "arrival_port": {"value": "...", "confidence": 0.85},\n'
+        '  "arrival_port": {"value": "...", "confidence": 0.85}\n'
         '  "confidence_note": "short explanation of stamp legibility"\n'
         "}"
     )
