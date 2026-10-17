@@ -26,7 +26,7 @@ from schemas.job import (
 )
 from services.job_worker import job_queue
 
-# Configure router logger
+# Configure router logger for diagnostic tracing
 logger = logging.getLogger("jobs_router")
 logger.setLevel(logging.INFO)
 
@@ -34,6 +34,7 @@ logger.setLevel(logging.INFO)
 # Router Configuration & Storage Paths
 # ==============================================================================
 
+# Initialize APIRouter with standard Form-C batch prefix and tags
 router = APIRouter(
     prefix="/jobs",
     tags=["Asynchronous Batch Extraction"]
@@ -52,11 +53,12 @@ async def save_uploaded_file(upload_file: UploadFile, destination_path: str) -> 
     """
     Asynchronously streams uploaded multipart file bytes into a local filesystem path.
 
-    :param upload_file: FastAPI UploadFile handle.
-    :param destination_path: Target disk path.
+    :param upload_file: FastAPI UploadFile handle received from multipart request.
+    :param destination_path: Absolute target path on disk where bytes will be written.
     """
     with open(destination_path, "wb") as buffer:
-        while content := await upload_file.read(1024 * 1024):  # Read in 1MB chunks
+        # Stream file in 1 MB chunks to prevent high memory spikes during upload
+        while content := await upload_file.read(1024 * 1024):
             buffer.write(content)
 
 
@@ -81,11 +83,12 @@ async def submit_documents_job(
     creates a QUEUED record in the SQLite database, and immediately enqueues the worker.
     The worker dynamically checks disk for secondary documents before processing them.
     """
-    # 1. Generate unique job identifier and dedicated disk directory
+    # 1. Generate unique job identifier (UUID4) and dedicated disk directory
     job_id = str(uuid.uuid4())
     job_dir = os.path.join(BASE_STORAGE_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
+    # Dictionary to keep track of stored document paths on disk
     doc_paths = {}
 
     try:
@@ -117,16 +120,17 @@ async def submit_documents_job(
             doc_paths["welcome_form"] = form_path
 
     except Exception as exc:
+        # Clean up disk directory on failure to avoid orphaned partial uploads
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to persist uploaded document files: {str(exc)}"
         )
 
-    # 6. Insert QUEUED entry into SQLite database
+    # 6. Insert initial QUEUED entry into SQLite database
     job_meta = create_job(job_id, doc_paths)
 
-    # 7. Enqueue directly into background worker
+    # 7. Enqueue directly into background worker queue
     await job_queue.put(job_id)
     logger.info(f"[*] Ingested job {job_id} and dispatched to processing queue immediately.")
 
@@ -161,6 +165,7 @@ async def attach_document_to_job(
             detail=f"Invalid doc_type '{doc_type}'. Expected one of: {list(valid_types)}"
         )
 
+    # Verify that the parent job exists in SQLite
     job_record = get_job(job_id)
     if not job_record:
         raise HTTPException(
@@ -175,7 +180,7 @@ async def attach_document_to_job(
     dest_path = os.path.join(job_dir, dest_filename)
     await save_uploaded_file(file, dest_path)
 
-    # Update database record doc_paths
+    # Update database record doc_paths manifest
     doc_paths = job_record.get("doc_paths", {})
     doc_paths[doc_type] = dest_path
 
@@ -192,7 +197,7 @@ async def attach_document_to_job(
 
 
 # ==============================================================================
-# Pipeline Execution Trigger Endpoint (Fallback)
+# Pipeline Execution Trigger Endpoint (Idempotent Guard)
 # ==============================================================================
 
 @router.post(
@@ -201,7 +206,9 @@ async def attach_document_to_job(
 )
 async def start_job_processing(job_id: str):
     """
-    Pushes the job ID into the sequential background queue if not already processing.
+    Idempotent trigger to enqueue a job if it has not yet entered the worker queue.
+    If the job is already QUEUED, PROCESSING, or COMPLETED, it safely bypasses
+    enqueueing to prevent duplicate multi-turn processing loops.
     """
     job_record = get_job(job_id)
     if not job_record:
@@ -211,14 +218,21 @@ async def start_job_processing(job_id: str):
         )
 
     current_status = job_record.get("status")
-    if current_status in ["PROCESSING", "COMPLETED"]:
+
+    # Guard: Prevent re-enqueueing if the job is already in the queue, running, or finished
+    if current_status in ["QUEUED", "PROCESSING", "COMPLETED"]:
+        logger.info(
+            f"[*] Bypassing duplicate queue dispatch for job {job_id} (current status: {current_status})."
+        )
         return {
             "status": current_status,
-            "message": f"Job {job_id} is already in state {current_status}."
+            "job_id": job_id,
+            "message": f"Job {job_id} is already in state {current_status}; duplicate dispatch skipped."
         }
 
+    # If the job was in a paused or non-enqueued state (e.g. DRAFT or retry), dispatch to queue
     await job_queue.put(job_id)
-    logger.info(f"[*] Job {job_id} explicitly dispatched to background execution queue.")
+    logger.info(f"[*] Job {job_id} dispatched to background execution queue.")
 
     return {
         "status": "QUEUED",
