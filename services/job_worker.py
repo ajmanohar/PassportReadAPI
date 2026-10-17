@@ -3,7 +3,7 @@ Background batch execution pipeline and serial queue worker for asynchronous For
 Processes multi-document bundles (Passport Bio, Visa, Entry Stamp, Welcome Form) sequentially.
 Executes an unconditional 'best-of-both' confidence tournament between Tesseract MRZ and
 Qwen2-VL for the Passport Bio page, selecting the highest-confidence extraction per field.
-Persists progress and results directly to the SQLite database.
+Persists progress and results directly to the SQLite database with detailed latency telemetry.
 """
 
 import asyncio
@@ -12,7 +12,8 @@ import json
 import logging
 import os
 import re
-from typing import Dict, Any, Optional
+import time
+from typing import Dict, Any, Optional, List
 
 from PIL import Image
 import torch
@@ -30,38 +31,54 @@ logger.setLevel(logging.INFO)
 # Global in-memory queue holding job UUID strings for sequential execution
 job_queue: asyncio.Queue = asyncio.Queue()
 
+# Base disk directory for persisting uploaded document images during asynchronous processing
+BASE_STORAGE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "storage", "jobs")
+
 
 # ==============================================================================
 # Image Preparation Helper
 # ==============================================================================
 
-def load_and_preprocess_image(file_path: str, max_dimension: int = 1280) -> Optional[Image.Image]:
+def load_and_preprocess_image(file_path: str, max_dimension: int = 1024) -> Optional[Image.Image]:
     """
     Loads an image from disk storage, standardizes color channels to RGB,
-    and downscales proportionally if the maximum dimension exceeds configured limits.
+    logs its native geometry, and downscales proportionally if the maximum
+    dimension exceeds configured limits to prevent CPU token and memory blowouts.
 
     :param file_path: Absolute or relative filesystem path to the image file.
-    :param max_dimension: Maximum allowed width or height in pixels.
+    :param max_dimension: Maximum allowed width or height in pixels (default 1024px).
     :return: Prepared PIL Image instance, or None if the file cannot be read.
     """
     if not os.path.exists(file_path):
-        logger.warning(f"File not found on disk: {file_path}")
+        logger.warning(f"[ImageLoader] File not found on disk: {file_path}")
         return None
 
     try:
+        start_t = time.perf_counter()
         image = Image.open(file_path)
+        orig_w, orig_h = image.size
 
         # Standardize color profile to 3-channel RGB (removes alpha or CMYK artifacts)
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        # Downscale proportionally to avoid memory bloat while preserving sharp text
-        if max(image.size) > max_dimension:
+        # Downscale proportionally to bound attention matrix computation while preserving sharp text
+        if max(orig_w, orig_h) > max_dimension:
             image.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+            new_w, new_h = image.size
+            logger.info(
+                f"[ImageLoader] Rescaled '{os.path.basename(file_path)}' from {orig_w}x{orig_h} "
+                f"to {new_w}x{new_h} in {(time.perf_counter() - start_t):.3f}s."
+            )
+        else:
+            logger.info(
+                f"[ImageLoader] Loaded '{os.path.basename(file_path)}' at native {orig_w}x{orig_h} "
+                f"in {(time.perf_counter() - start_t):.3f}s."
+            )
 
         return image
     except Exception as exc:
-        logger.error(f"Failed to load or preprocess image from '{file_path}': {str(exc)}")
+        logger.error(f"[ImageLoader] Failed to load/preprocess '{file_path}': {str(exc)}", exc_info=True)
         return None
 
 
@@ -69,14 +86,15 @@ def load_and_preprocess_image(file_path: str, max_dimension: int = 1280) -> Opti
 # Inference Subroutine Helpers
 # ==============================================================================
 
-def run_vlm_inference(image: Image.Image, system_prompt: str, ml_state: dict) -> dict:
+def run_vlm_inference(image: Image.Image, system_prompt: str, ml_state: dict, stage_label: str = "VLM") -> dict:
     """
     Executes a structured query against the shared in-memory Qwen2-VL model instance
-    and parses the output into a Python dictionary.
+    with detailed per-stage execution timing and parses the output into a Python dictionary.
 
     :param image: Preprocessed PIL Image instance.
     :param system_prompt: Guidance text instructing the VLM on expected JSON fields.
     :param ml_state: Shared dictionary holding 'model' and 'processor' instances.
+    :param stage_label: Diagnostic label for logging (e.g. 'Passport Bio', 'Visa', etc.).
     :return: Extracted key-value dictionary parsed from the model's generated JSON.
     """
     from qwen_vl_utils import process_vision_info
@@ -86,6 +104,9 @@ def run_vlm_inference(image: Image.Image, system_prompt: str, ml_state: dict) ->
 
     if not model or not processor:
         raise RuntimeError("Qwen2-VL model and processor are not loaded in ml_state.")
+
+    start_vlm_time = time.perf_counter()
+    logger.info(f"[{stage_label}] Preparing prompt tensor inputs (image: {image.size[0]}x{image.size[1]})...")
 
     # Format user prompt according to Qwen2-VL chat conversation template
     messages = [
@@ -120,6 +141,9 @@ def run_vlm_inference(image: Image.Image, system_prompt: str, ml_state: dict) ->
     # Move tensors to designated execution device (CPU)
     inputs = {k: v.to(settings.device) for k, v in inputs.items()}
 
+    logger.info(f"[{stage_label}] Beginning PyTorch CPU token generation (max_new_tokens={settings.max_new_tokens})...")
+    gen_start = time.perf_counter()
+
     # Run deterministic inference without calculating gradients
     with torch.no_grad():
         generated_ids = model.generate(
@@ -128,10 +152,14 @@ def run_vlm_inference(image: Image.Image, system_prompt: str, ml_state: dict) ->
             do_sample=False
         )
 
+    gen_duration = time.perf_counter() - gen_start
+    total_duration = time.perf_counter() - start_vlm_time
+
     # Separate model-generated response tokens from the input prompt tokens
     generated_ids_trimmed = [
         out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
     ]
+    tokens_generated = len(generated_ids_trimmed[0]) if generated_ids_trimmed else 0
 
     # Decode tokens into UTF-8 string
     raw_text = processor.batch_decode(
@@ -140,14 +168,23 @@ def run_vlm_inference(image: Image.Image, system_prompt: str, ml_state: dict) ->
         clean_up_tokenization_spaces=False
     )[0]
 
+    logger.info(
+        f"[{stage_label}] Generated {tokens_generated} tokens in {gen_duration:.2f}s "
+        f"({tokens_generated / max(0.01, gen_duration):.1f} tok/s). Total stage latency: {total_duration:.2f}s."
+    )
+
     # Extract JSON string payload bounded by braces
     try:
         match = re.search(r"\{.*\}", raw_text, re.DOTALL)
         if match:
-            return json.loads(match.group(0))
+            parsed_json = json.loads(match.group(0))
+            return parsed_json
         return json.loads(raw_text)
-    except Exception:
-        logger.warning(f"Failed to parse JSON from VLM output. Raw text: {raw_text[:200]}")
+    except Exception as parse_err:
+        logger.warning(
+            f"[{stage_label}] Failed to parse structured JSON from model response: {parse_err}. "
+            f"Raw text excerpt: {raw_text[:250]}"
+        )
         return {"confidence_note": f"Raw model response: {raw_text}"}
 
 
@@ -174,7 +211,7 @@ def normalize_vlm_field(raw_field: Any, default_score: float = 0.80, source: str
         val = str(raw_field)
         raw_conf = default_score
 
-    if not val or str(val).strip().lower() in ["null", "none", ""]:
+    if not val or str(val).strip().lower() in ["null", "none", "", "n/a", "unknown"]:
         return FieldResult(value=None, confidence=0.0, source=source)
 
     try:
@@ -230,6 +267,41 @@ def select_best_field(
 
 
 # ==============================================================================
+# Dynamic Document Discovery Helper
+# ==============================================================================
+
+def refresh_document_paths(job_id: str) -> Dict[str, str]:
+    """
+    Queries SQLite and inspects the on-disk job directory to discover any files
+    attached after the initial job ingestion. Guarantees that documents uploaded
+    while previous stages were executing are never missed.
+
+    :param job_id: UUID tracking string.
+    :return: Fresh mapping of document types to verified local file paths.
+    """
+    job_record = get_job(job_id)
+    doc_paths: Dict[str, str] = job_record.get("doc_paths", {}) if job_record else {}
+
+    job_dir = os.path.join(BASE_STORAGE_DIR, job_id)
+    if os.path.isdir(job_dir):
+        # Scan filesystem for standard attachment prefix names
+        for filename in os.listdir(job_dir):
+            full_path = os.path.join(job_dir, filename)
+            if not os.path.isfile(full_path):
+                continue
+            if filename.startswith("bio_") and "passport_bio" not in doc_paths:
+                doc_paths["passport_bio"] = full_path
+            elif filename.startswith("visa_") and "visa_page" not in doc_paths:
+                doc_paths["visa_page"] = full_path
+            elif filename.startswith("stamp_") and "entry_stamp" not in doc_paths:
+                doc_paths["entry_stamp"] = full_path
+            elif filename.startswith("form_") and "welcome_form" not in doc_paths:
+                doc_paths["welcome_form"] = full_path
+
+    return doc_paths
+
+
+# ==============================================================================
 # Job Processing Pipeline
 # ==============================================================================
 
@@ -242,27 +314,25 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
     :param job_id: Unique UUID string identifier of the target job.
     :param ml_state: Shared dictionary holding model handles.
     """
-    logger.info(f"[*] Starting processing for job: {job_id}")
+    job_start_time = time.perf_counter()
+    logger.info(f"[*] Starting extraction pipeline for job: {job_id}")
     update_job_status(job_id, "PROCESSING")
 
-    job_record = get_job(job_id)
-    if not job_record:
-        logger.error(f"Job record {job_id} not found in database.")
-        return
-
-    doc_paths: Dict[str, str] = job_record.get("doc_paths", {})
     fused_record = GuestFormCRecord()
     processing_notes = []
 
     try:
         # ======================================================================
-        # PASSPORT BIO PAGE: UNCONDITIONAL DUAL-ENGINE TOURNAMENT
+        # 1. PASSPORT BIO PAGE: DUAL-ENGINE TOURNAMENT (MRZ + VLM)
         # ======================================================================
+        doc_paths = refresh_document_paths(job_id)
         bio_path = doc_paths.get("passport_bio")
+
         if bio_path and os.path.exists(bio_path):
-            logger.info(f"[{job_id}] Initiating dual-engine extraction for passport bio page...")
+            logger.info(f"[{job_id}] Stage 1/4: Dual-engine extraction for passport bio page ({bio_path})...")
 
             # --- Engine A: Tesseract MRZ Execution ---
+            mrz_start = time.perf_counter()
             mrz_candidates: Dict[str, FieldResult] = {}
             valid_mrz_flag = False
 
@@ -311,19 +381,25 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                     mrz_candidates["sex"] = mk_text(mrz_dict.get("sex"))
                     mrz_candidates["passport_expiry_date"] = mk_checked(mrz_dict.get("expiration_date"), check_exp)
 
-                    processing_notes.append(f"MRZ parsed (valid: {valid_mrz_flag}, score: {valid_score}).")
+                    mrz_duration = time.perf_counter() - mrz_start
+                    logger.info(
+                        f"[{job_id}] Tesseract MRZ completed in {mrz_duration:.2f}s "
+                        f"(valid={valid_mrz_flag}, score={valid_score})."
+                    )
+                    processing_notes.append(f"MRZ parsed in {mrz_duration:.2f}s (valid: {valid_mrz_flag}, score: {valid_score}).")
                 else:
-                    processing_notes.append("MRZ not detected on passport image.")
+                    mrz_duration = time.perf_counter() - mrz_start
+                    logger.info(f"[{job_id}] Tesseract MRZ found no patterns ({mrz_duration:.2f}s).")
+                    processing_notes.append(f"MRZ not detected ({mrz_duration:.2f}s).")
             except Exception as mrz_exc:
-                logger.warning(f"[{job_id}] MRZ extraction error: {str(mrz_exc)}")
-                processing_notes.append(f"MRZ exception: {str(mrz_exc)}")
+                logger.warning(f"[{job_id}] MRZ extraction error: {str(mrz_exc)}", exc_info=True)
+                processing_notes.append(f"MRZ error: {str(mrz_exc)}")
 
             # --- Engine B: Qwen2-VL Visual Bio Execution ---
             vlm_candidates: Dict[str, FieldResult] = {}
             bio_image = await asyncio.to_thread(load_and_preprocess_image, bio_path)
 
             if bio_image:
-                logger.info(f"[{job_id}] Running Qwen2-VL visual bio extraction...")
                 bio_prompt = (
                     "Carefully read the passport bio page image. For each field, provide the extracted string value "
                     "and your visual confidence score between 0.0 and 1.0 based on clarity and legibility. "
@@ -339,7 +415,7 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                     '  "confidence_note": "short explanation of image quality"\n'
                     "}"
                 )
-                vlm_bio = await asyncio.to_thread(run_vlm_inference, bio_image, bio_prompt, ml_state)
+                vlm_bio = await asyncio.to_thread(run_vlm_inference, bio_image, bio_prompt, ml_state, "Passport Bio VLM")
 
                 vlm_candidates["surname"] = normalize_vlm_field(vlm_bio.get("surname"))
                 vlm_candidates["given_names"] = normalize_vlm_field(vlm_bio.get("given_names"))
@@ -397,13 +473,18 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                 vlm_candidates.get("passport_expiry_date", empty_field),
                 processing_notes
             )
+        else:
+            logger.warning(f"[{job_id}] Passport bio image not found on disk: {bio_path}")
+            processing_notes.append("Passport bio image missing from job directory.")
 
         # ======================================================================
-        # VISA / OCI EXTRACTION (QWEN2-VL)
+        # 2. VISA / OCI EXTRACTION (QWEN2-VL)
         # ======================================================================
+        doc_paths = refresh_document_paths(job_id)
         visa_path = doc_paths.get("visa_page")
+
         if visa_path and os.path.exists(visa_path):
-            logger.info(f"[{job_id}] Running Qwen2-VL visa extraction...")
+            logger.info(f"[{job_id}] Stage 2/4: Running Qwen2-VL visa extraction ({visa_path})...")
             visa_image = await asyncio.to_thread(load_and_preprocess_image, visa_path)
             if visa_image:
                 visa_prompt = (
@@ -417,20 +498,24 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                     '  "place_of_issue": {"value": "...", "confidence": 0.85}\n'
                     "}"
                 )
-                vlm_visa = await asyncio.to_thread(run_vlm_inference, visa_image, visa_prompt, ml_state)
+                vlm_visa = await asyncio.to_thread(run_vlm_inference, visa_image, visa_prompt, ml_state, "Visa VLM")
                 fused_record.visa_number = normalize_vlm_field(vlm_visa.get("visa_number"))
                 fused_record.visa_type = normalize_vlm_field(vlm_visa.get("visa_type"))
                 fused_record.visa_issue_date = normalize_vlm_field(vlm_visa.get("issue_date"))
                 fused_record.visa_expiry_date = normalize_vlm_field(vlm_visa.get("expiry_date"))
                 fused_record.visa_place_of_issue = normalize_vlm_field(vlm_visa.get("place_of_issue"))
                 processing_notes.append("Visa / OCI details extracted via Qwen2-VL.")
+        else:
+            logger.info(f"[{job_id}] Stage 2/4: No visa_page document attached to job. Skipping.")
 
         # ======================================================================
-        # IMMIGRATION ENTRY STAMP EXTRACTION (QWEN2-VL)
+        # 3. IMMIGRATION ENTRY STAMP EXTRACTION (QWEN2-VL)
         # ======================================================================
+        doc_paths = refresh_document_paths(job_id)
         stamp_path = doc_paths.get("entry_stamp")
+
         if stamp_path and os.path.exists(stamp_path):
-            logger.info(f"[{job_id}] Running Qwen2-VL entry stamp extraction...")
+            logger.info(f"[{job_id}] Stage 3/4: Running Qwen2-VL entry stamp extraction ({stamp_path})...")
             stamp_image = await asyncio.to_thread(load_and_preprocess_image, stamp_path)
             if stamp_image:
                 stamp_prompt = (
@@ -441,17 +526,21 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                     '  "arrival_port": {"value": "...", "confidence": 0.85}\n'
                     "}"
                 )
-                vlm_stamp = await asyncio.to_thread(run_vlm_inference, stamp_image, stamp_prompt, ml_state)
+                vlm_stamp = await asyncio.to_thread(run_vlm_inference, stamp_image, stamp_prompt, ml_state, "Stamp VLM")
                 fused_record.arrival_date_india = normalize_vlm_field(vlm_stamp.get("arrival_date"))
                 fused_record.arrival_port_india = normalize_vlm_field(vlm_stamp.get("arrival_port"))
                 processing_notes.append("Entry stamp details extracted via Qwen2-VL.")
+        else:
+            logger.info(f"[{job_id}] Stage 3/4: No entry_stamp document attached to job. Skipping.")
 
         # ======================================================================
-        # HANDWRITTEN ARRIVAL REPORT EXTRACTION (FORM-C RULE 14)
+        # 4. HANDWRITTEN ARRIVAL REPORT EXTRACTION (FORM-C RULE 14)
         # ======================================================================
+        doc_paths = refresh_document_paths(job_id)
         welcome_path = doc_paths.get("welcome_form")
+
         if welcome_path and os.path.exists(welcome_path):
-            logger.info(f"[{job_id}] Running Qwen2-VL handwritten Form-C arrival report extraction...")
+            logger.info(f"[{job_id}] Stage 4/4: Running Qwen2-VL handwritten Form-C extraction ({welcome_path})...")
             welcome_image = await asyncio.to_thread(load_and_preprocess_image, welcome_path)
             if welcome_image:
                 welcome_prompt = (
@@ -478,7 +567,7 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                     '  "country_city_arrived_to_india": {"value": "...", "confidence": 0.80}\n'
                     "}"
                 )
-                vlm_form = await asyncio.to_thread(run_vlm_inference, welcome_image, welcome_prompt, ml_state)
+                vlm_form = await asyncio.to_thread(run_vlm_inference, welcome_image, welcome_prompt, ml_state, "Welcome Form VLM")
 
                 # Map extracted Form-C items into fused record with source attribution
                 fused_record.permanent_address = normalize_vlm_field(vlm_form.get("full_address"), source="welcome_form")
@@ -503,15 +592,21 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                     fused_record.nationality = normalize_vlm_field(vlm_form.get("nationality"), source="welcome_form")
 
                 processing_notes.append("Handwritten Form-C arrival report extracted via Qwen2-VL.")
+        else:
+            logger.info(f"[{job_id}] Stage 4/4: No welcome_form document attached to job. Skipping.")
 
-        # Persist final fused record with diagnostic tournament logs
+        # Persist final fused record with diagnostic tournament logs and total elapsed duration
+        total_job_duration = time.perf_counter() - job_start_time
+        processing_notes.append(f"Complete pipeline executed in {total_job_duration:.2f}s.")
         fused_record.processing_notes = processing_notes
+
         save_job_result(job_id, fused_record.model_dump())
-        logger.info(f"[+] Job {job_id} successfully processed and marked COMPLETED.")
+        logger.info(f"[+] Job {job_id} successfully completed in {total_job_duration:.2f}s.")
 
     except Exception as exc:
-        logger.error(f"[!] Processing failed for job {job_id}: {str(exc)}", exc_info=True)
-        update_job_status(job_id, "FAILED", error_message=str(exc))
+        total_job_duration = time.perf_counter() - job_start_time
+        logger.error(f"[!] Pipeline processing aborted for job {job_id} after {total_job_duration:.2f}s: {str(exc)}", exc_info=True)
+        update_job_status(job_id, "FAILED", error_message=f"{str(exc)} (after {total_job_duration:.2f}s)")
 
 
 # ==============================================================================
