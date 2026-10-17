@@ -4,6 +4,7 @@ Provides non-blocking intake endpoints for multi-document bundles,
 enqueuing background extraction tasks and exposing status polling routes.
 """
 
+import json
 import logging
 import os
 import shutil
@@ -15,7 +16,7 @@ from pydantic import ValidationError
 
 # Configuration, database, and schema imports
 from config import settings
-from storage.db import create_job, get_job, list_recent_jobs
+from storage.db import create_job, get_job, list_recent_jobs, get_db_connection
 from schemas.job import (
     JobSubmissionResponse,
     JobDetailResponse,
@@ -133,6 +134,60 @@ async def submit_documents_job(
         status=JobStatus.QUEUED,
         created_at=job_meta["created_at"]
     )
+
+
+# ==============================================================================
+# Granular Attachment Endpoints (Supports Single-File Mobile Uploaders)
+# ==============================================================================
+
+@router.post(
+    "/{job_id}/attach/{doc_type}",
+    summary="Attach an additional document image to an existing job"
+)
+async def attach_document_to_job(
+    job_id: str,
+    doc_type: str,
+    file: UploadFile = File(...)
+):
+    """
+    Attaches secondary captures (visa_page, entry_stamp, welcome_form) to an existing job directory
+    and updates the database path manifest.
+    """
+    valid_types = {"visa_page", "entry_stamp", "welcome_form"}
+    if doc_type not in valid_types:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid doc_type '{doc_type}'. Expected one of: {list(valid_types)}"
+        )
+
+    job_record = get_job(job_id)
+    if not job_record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job with ID '{job_id}' not found."
+        )
+
+    job_dir = os.path.join(BASE_STORAGE_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+
+    dest_filename = f"{doc_type}_{file.filename}"
+    dest_path = os.path.join(job_dir, dest_filename)
+    await save_uploaded_file(file, dest_path)
+
+    # Update database record doc_paths
+    doc_paths = job_record.get("doc_paths", {})
+    doc_paths[doc_type] = dest_path
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE jobs SET doc_paths_json = ? WHERE job_id = ?;",
+            (json.dumps(doc_paths), job_id)
+        )
+        conn.commit()
+
+    logger.info(f"[*] Attached {doc_type} to job {job_id}.")
+    return {"status": "success", "job_id": job_id, "attached": doc_type}
 
 
 # ==============================================================================
