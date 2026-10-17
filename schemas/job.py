@@ -2,6 +2,7 @@
 Pydantic data schemas for asynchronous batch document processing.
 Defines data structures for job creation, polling status, and fused Form-C extraction payloads
 with per-field confidence scores and extraction provenance tracking.
+Fully aligned with Bureau of Immigration Form-C (Rule 14) Arrival Report fields.
 """
 
 from datetime import datetime
@@ -23,7 +24,7 @@ class JobStatus(str, Enum):
 class FieldResult(BaseModel):
     """
     Represents an extracted field value paired with a normalized confidence score
-    and source attribution (e.g., 'tesseract_mrz' vs. 'qwen2_vl').
+    and source attribution (e.g., 'tesseract_mrz', 'qwen2_vl', or 'welcome_form').
     """
     # The extracted text value (string or None)
     value: Optional[str] = Field(
@@ -39,7 +40,7 @@ class FieldResult(BaseModel):
         description="Confidence score for this specific field between 0.0 and 1.0"
     )
 
-    # Origin of the winning value ('tesseract_mrz', 'qwen2_vl', or 'unassigned')
+    # Origin of the winning value ('tesseract_mrz', 'qwen2_vl', 'welcome_form', or 'unassigned')
     source: str = Field(
         default="unassigned",
         description="The engine or pipeline stage that produced this winning value"
@@ -80,35 +81,65 @@ class GuestFormCRecord(BaseModel):
     """
     Unified, fused bio-data model merging MRZ, VLM bio, Visa, Stamp, and Welcome Form data.
     Every individual field carries its own value, confidence score (0.0 - 1.0), and source engine.
+    Matches all 12 items of the Bureau of Immigration Form-C Arrival Report (Rule 14).
     """
-    # --- Passport & Bio-Data (Selected from best-of-both MRZ & VLM tournament) ---
+    # --- Item 1 & Passport Bio-Data ---
     surname: FieldResult = Field(default_factory=FieldResult, description="Holder's surname / family name")
     given_names: FieldResult = Field(default_factory=FieldResult, description="Holder's given names")
     sex: FieldResult = Field(default_factory=FieldResult, description="Sex code ('M', 'F', or 'X')")
     date_of_birth: FieldResult = Field(default_factory=FieldResult, description="Date of birth (YYYY-MM-DD)")
-    nationality: FieldResult = Field(default_factory=FieldResult, description="Holder's 3-letter ICAO country code")
+    nationality: FieldResult = Field(default_factory=FieldResult, description="Holder's country code or nationality")
     passport_number: FieldResult = Field(default_factory=FieldResult, description="Unique passport identifier number")
     passport_expiry_date: FieldResult = Field(default_factory=FieldResult, description="Passport expiration date (YYYY-MM-DD)")
     valid_mrz: bool = Field(default=False, description="True if ICAO Doc 9303 checksum validation succeeded")
 
-    # --- Visa / OCI Details ---
+    # --- Item 2: Guest Contact & Address Details ---
+    permanent_address: FieldResult = Field(default_factory=FieldResult, description="Full residential address")
+    city: FieldResult = Field(default_factory=FieldResult, description="Home city")
+    country: FieldResult = Field(default_factory=FieldResult, description="Home country")
+    contact_email: FieldResult = Field(default_factory=FieldResult, description="Guest email address")
+    contact_phone: FieldResult = Field(default_factory=FieldResult, description="Guest telephone / mobile number")
+
+    # --- Items 3 & 4: Visa / OCI Details ---
     visa_number: FieldResult = Field(default_factory=FieldResult, description="Indian Visa number or OCI registration number")
     visa_type: FieldResult = Field(default_factory=FieldResult, description="Visa category/type (Tourist, Business, OCI, etc.)")
     visa_issue_date: FieldResult = Field(default_factory=FieldResult, description="Visa issue date (YYYY-MM-DD)")
     visa_expiry_date: FieldResult = Field(default_factory=FieldResult, description="Visa expiry date (YYYY-MM-DD)")
     visa_place_of_issue: FieldResult = Field(default_factory=FieldResult, description="City / authority where visa was issued")
 
-    # --- Immigration Entry Stamp Details ---
-    arrival_date_india: FieldResult = Field(default_factory=FieldResult, description="Date entered India from immigration stamp (YYYY-MM-DD)")
+    # --- Item 5: Immigration Entry Stamp ---
+    arrival_date_india: FieldResult = Field(default_factory=FieldResult, description="Date of arrival in India (YYYY-MM-DD)")
     arrival_port_india: FieldResult = Field(default_factory=FieldResult, description="Port or airport of entry into India")
 
-    # --- Handwritten Welcome Form Details ---
-    contact_phone: FieldResult = Field(default_factory=FieldResult, description="Guest phone/mobile number")
-    contact_email: FieldResult = Field(default_factory=FieldResult, description="Guest email address")
-    permanent_address: FieldResult = Field(default_factory=FieldResult, description="Permanent home address in home country")
-    arrived_from: FieldResult = Field(default_factory=FieldResult, description="Place or city arrived from before check-in")
-    proceeding_to: FieldResult = Field(default_factory=FieldResult, description="Destination proceeding to next")
-    purpose_of_visit: FieldResult = Field(default_factory=FieldResult, description="Purpose of visit and profession")
+    # --- Items 6 - 12: Homestay Arrival & Movement (Form-C Rule 14) ---
+    arrival_datetime_homestay: FieldResult = Field(
+        default_factory=FieldResult,
+        description="Item 6: Date and time of arrival in the home stay"
+    )
+    arrived_from: FieldResult = Field(
+        default_factory=FieldResult,
+        description="Item 7: City / place arrived from"
+    )
+    proceeding_to: FieldResult = Field(
+        default_factory=FieldResult,
+        description="Item 8: Destination proceeding to next"
+    )
+    stay_duration_india: FieldResult = Field(
+        default_factory=FieldResult,
+        description="Item 9: Proposed duration of stay in India"
+    )
+    purpose_of_visit: FieldResult = Field(
+        default_factory=FieldResult,
+        description="Item 10: Purpose of visit and profession"
+    )
+    expected_departure_date: FieldResult = Field(
+        default_factory=FieldResult,
+        description="Item 11: Expected date of departure from the homestay"
+    )
+    arrived_country_city_india: FieldResult = Field(
+        default_factory=FieldResult,
+        description="Item 12: Country & city arrived to India"
+    )
 
     # --- Pipeline Diagnostics ---
     processing_notes: List[str] = Field(

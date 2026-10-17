@@ -155,16 +155,17 @@ def run_vlm_inference(image: Image.Image, system_prompt: str, ml_state: dict) ->
 # Tournament Selection & Normalization Helpers
 # ==============================================================================
 
-def normalize_vlm_field(raw_field: Any, default_score: float = 0.80) -> FieldResult:
+def normalize_vlm_field(raw_field: Any, default_score: float = 0.80, source: str = "qwen2_vl") -> FieldResult:
     """
     Parses a nested or scalar field returned by Qwen2-VL into a validated FieldResult.
 
     :param raw_field: Dict containing {'value': ..., 'confidence': ...} or a raw scalar.
     :param default_score: Default confidence score if none is specified by the model.
+    :param source: Pipeline provenance label.
     :return: Sanitized FieldResult instance.
     """
     if raw_field is None:
-        return FieldResult(value=None, confidence=0.0, source="qwen2_vl")
+        return FieldResult(value=None, confidence=0.0, source=source)
 
     if isinstance(raw_field, dict):
         val = raw_field.get("value")
@@ -174,7 +175,7 @@ def normalize_vlm_field(raw_field: Any, default_score: float = 0.80) -> FieldRes
         raw_conf = default_score
 
     if not val or str(val).strip().lower() in ["null", "none", ""]:
-        return FieldResult(value=None, confidence=0.0, source="qwen2_vl")
+        return FieldResult(value=None, confidence=0.0, source=source)
 
     try:
         conf_float = float(raw_conf)
@@ -185,7 +186,7 @@ def normalize_vlm_field(raw_field: Any, default_score: float = 0.80) -> FieldRes
     return FieldResult(
         value=str(val).strip(),
         confidence=round(conf_float, 2),
-        source="qwen2_vl"
+        source=source
     )
 
 
@@ -446,34 +447,62 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                 processing_notes.append("Entry stamp details extracted via Qwen2-VL.")
 
         # ======================================================================
-        # HANDWRITTEN WELCOME FORM EXTRACTION (FORM-C RULE 14)
+        # HANDWRITTEN ARRIVAL REPORT EXTRACTION (FORM-C RULE 14)
         # ======================================================================
         welcome_path = doc_paths.get("welcome_form")
         if welcome_path and os.path.exists(welcome_path):
-            logger.info(f"[{job_id}] Running Qwen2-VL handwritten welcome form extraction...")
+            logger.info(f"[{job_id}] Running Qwen2-VL handwritten Form-C arrival report extraction...")
             welcome_image = await asyncio.to_thread(load_and_preprocess_image, welcome_path)
             if welcome_image:
                 welcome_prompt = (
-                    "Extract handwritten Form C Arrival Report fields from the image. "
-                    "For each field provide value and confidence (0.0 - 1.0). "
-                    "Output JSON formatted exactly as:\n"
+                    "Carefully read the handwritten ARRIVAL REPORT (THE REGISTRATION OF FOREIGNERS RULES 1939 FORM C RULE 14) "
+                    "document image. Extract every numbered item accurately. "
+                    "For each field, return a JSON object with 'value' and 'confidence' (0.0 - 1.0).\n"
+                    "Required JSON format:\n"
                     "{\n"
+                    '  "name_of_foreigner": {"value": "...", "confidence": 0.85},\n'
                     '  "full_address": {"value": "...", "confidence": 0.80},\n'
-                    '  "email": {"value": "...", "confidence": 0.80},\n'
-                    '  "mobile": {"value": "...", "confidence": 0.80},\n'
+                    '  "city": {"value": "...", "confidence": 0.80},\n'
+                    '  "country": {"value": "...", "confidence": 0.80},\n'
+                    '  "email": {"value": "...", "confidence": 0.85},\n'
+                    '  "telephone_mobile": {"value": "...", "confidence": 0.85},\n'
+                    '  "nationality": {"value": "...", "confidence": 0.80},\n'
+                    '  "place_of_issue_of_visa": {"value": "...", "confidence": 0.80},\n'
+                    '  "date_of_arrival_in_india": {"value": "YYYY-MM-DD", "confidence": 0.80},\n'
+                    '  "datetime_arrival_homestay": {"value": "...", "confidence": 0.80},\n'
                     '  "arrived_from": {"value": "...", "confidence": 0.80},\n'
                     '  "proceeding_to": {"value": "...", "confidence": 0.80},\n'
-                    '  "purpose_of_visit_profession": {"value": "...", "confidence": 0.80}\n'
+                    '  "proposed_duration_stay_india": {"value": "...", "confidence": 0.80},\n'
+                    '  "purpose_of_visit_profession": {"value": "...", "confidence": 0.80},\n'
+                    '  "expected_date_departure": {"value": "YYYY-MM-DD", "confidence": 0.80},\n'
+                    '  "country_city_arrived_to_india": {"value": "...", "confidence": 0.80}\n'
                     "}"
                 )
                 vlm_form = await asyncio.to_thread(run_vlm_inference, welcome_image, welcome_prompt, ml_state)
-                fused_record.permanent_address = normalize_vlm_field(vlm_form.get("full_address"))
-                fused_record.contact_email = normalize_vlm_field(vlm_form.get("email"))
-                fused_record.contact_phone = normalize_vlm_field(vlm_form.get("mobile"))
-                fused_record.arrived_from = normalize_vlm_field(vlm_form.get("arrived_from"))
-                fused_record.proceeding_to = normalize_vlm_field(vlm_form.get("proceeding_to"))
-                fused_record.purpose_of_visit = normalize_vlm_field(vlm_form.get("purpose_of_visit_profession"))
-                processing_notes.append("Handwritten welcome form extracted via Qwen2-VL.")
+
+                # Map extracted Form-C items into fused record with source attribution
+                fused_record.permanent_address = normalize_vlm_field(vlm_form.get("full_address"), source="welcome_form")
+                fused_record.city = normalize_vlm_field(vlm_form.get("city"), source="welcome_form")
+                fused_record.country = normalize_vlm_field(vlm_form.get("country"), source="welcome_form")
+                fused_record.contact_email = normalize_vlm_field(vlm_form.get("email"), source="welcome_form")
+                fused_record.contact_phone = normalize_vlm_field(vlm_form.get("telephone_mobile"), source="welcome_form")
+                fused_record.arrival_datetime_homestay = normalize_vlm_field(vlm_form.get("datetime_arrival_homestay"), source="welcome_form")
+                fused_record.arrived_from = normalize_vlm_field(vlm_form.get("arrived_from"), source="welcome_form")
+                fused_record.proceeding_to = normalize_vlm_field(vlm_form.get("proceeding_to"), source="welcome_form")
+                fused_record.stay_duration_india = normalize_vlm_field(vlm_form.get("proposed_duration_stay_india"), source="welcome_form")
+                fused_record.purpose_of_visit = normalize_vlm_field(vlm_form.get("purpose_of_visit_profession"), source="welcome_form")
+                fused_record.expected_departure_date = normalize_vlm_field(vlm_form.get("expected_date_departure"), source="welcome_form")
+                fused_record.arrived_country_city_india = normalize_vlm_field(vlm_form.get("country_city_arrived_to_india"), source="welcome_form")
+
+                # Fallback comparisons if passport or visa did not detect values
+                if not fused_record.visa_place_of_issue.value:
+                    fused_record.visa_place_of_issue = normalize_vlm_field(vlm_form.get("place_of_issue_of_visa"), source="welcome_form")
+                if not fused_record.arrival_date_india.value:
+                    fused_record.arrival_date_india = normalize_vlm_field(vlm_form.get("date_of_arrival_in_india"), source="welcome_form")
+                if not fused_record.nationality.value:
+                    fused_record.nationality = normalize_vlm_field(vlm_form.get("nationality"), source="welcome_form")
+
+                processing_notes.append("Handwritten Form-C arrival report extracted via Qwen2-VL.")
 
         # Persist final fused record with diagnostic tournament logs
         fused_record.processing_notes = processing_notes
