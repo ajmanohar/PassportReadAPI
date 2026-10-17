@@ -302,4 +302,3 @@ async def list_jobs(limit: int = 50) -> List[JobDetailResponse]:
             )
         )
     return response_items
-
