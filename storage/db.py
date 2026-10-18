@@ -1,7 +1,7 @@
 """
 SQLite database storage layer for PassportReadAPI.
 Manages schema initialization, job lifecycle state transitions, document path manifests,
-and progressive intermediate extraction persistence for asynchronous batch jobs.
+progressive intermediate extraction persistence for asynchronous batch jobs, and startup recovery.
 """
 
 import json
@@ -31,8 +31,11 @@ def get_db_connection() -> sqlite3.Connection:
     Creates and returns a SQLite database connection configured with
     row factory for dictionary-like column access and immediate timeout.
     """
+    # Ensure storage directory exists on the filesystem
     os.makedirs(STORAGE_DIR, exist_ok=True)
+    # Establish connection with a 30s timeout to handle concurrent disk writes
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    # Enable access by column name
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -49,6 +52,7 @@ def init_db() -> None:
     logger.info(f"[*] Initializing SQLite database schema at: {DB_PATH}")
     with get_db_connection() as conn:
         cursor = conn.cursor()
+        # Create jobs tracking table
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS jobs (
@@ -62,6 +66,7 @@ def init_db() -> None:
             );
             """
         )
+        # Create index to accelerate pending/processing status lookups
         cursor.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_jobs_status_created 
@@ -70,6 +75,48 @@ def init_db() -> None:
         )
         conn.commit()
     logger.info("[*] SQLite database schema initialized successfully.")
+
+
+# Alias for backwards compatibility with app.py imports
+initialize_database = init_db
+
+
+# ==============================================================================
+# Job Recovery on Server Startup
+# ==============================================================================
+
+def get_all_pending_jobs() -> List[Dict[str, Any]]:
+    """
+    Queries SQLite for any jobs left in 'QUEUED' or 'PROCESSING' state on system startup
+    so the background queue worker can re-enqueue and complete them after server reboot.
+
+    :return: List of job record dictionaries that require processing.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT job_id, status, created_at, updated_at, doc_paths_json, result_json, error_message
+            FROM jobs
+            WHERE status IN ('QUEUED', 'PROCESSING')
+            ORDER BY created_at ASC;
+            """
+        )
+        rows = cursor.fetchall()
+
+    pending_jobs = []
+    for row in rows:
+        pending_jobs.append({
+            "job_id": row["job_id"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "doc_paths": json.loads(row["doc_paths_json"]) if row["doc_paths_json"] else {},
+            "result": json.loads(row["result_json"]) if row["result_json"] else None,
+            "error_message": row["error_message"]
+        })
+    logger.info(f"[*] Recovered {len(pending_jobs)} pending job(s) from SQLite on startup.")
+    return pending_jobs
 
 
 # ==============================================================================
