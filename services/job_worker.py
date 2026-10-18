@@ -10,7 +10,7 @@ Tuned specifically for CPU execution:
 - Caps visual tokens via settings.min_pixels and settings.max_pixels (49 - 144 patches).
 - Downscales images to settings.max_image_dimension (512px) to prevent attention matrix latency blowouts.
 - Enforces strict PyTorch thread allocation to all physical CPU cores.
-- Emits real-time intermediate state to SQLite so mobile dashboard pills turn green progressively.
+- Allocates up to 512 tokens for handwritten Form-C table extraction to prevent JSON truncation.
 - Features explicit row-anchor visual prompting matching Form C (Rule 14) table structure.
 """
 
@@ -66,7 +66,6 @@ def load_and_preprocess_image(
         logger.warning(f"[ImageLoader] File not found on disk: {file_path}")
         return None
 
-    # Resolve target dimension from settings if not explicitly provided
     target_max_dim = max_dimension if max_dimension is not None else settings.max_image_dimension
 
     try:
@@ -74,7 +73,7 @@ def load_and_preprocess_image(
         image = Image.open(file_path)
         orig_w, orig_h = image.size
 
-        # Standardize color profile to 3-channel RGB (removes alpha or CMYK artifacts)
+        # Standardize color profile to 3-channel RGB
         if image.mode != "RGB":
             image = image.convert("RGB")
 
@@ -99,18 +98,68 @@ def load_and_preprocess_image(
 
 
 # ==============================================================================
-# Inference Subroutine Helpers
+# Robust JSON Parsing Helper
 # ==============================================================================
 
-def run_vlm_inference(image: Image.Image, system_prompt: str, ml_state: dict, stage_label: str = "VLM") -> dict:
+def clean_and_parse_json(raw_text: str) -> dict:
+    """
+    Attempts standard JSON parsing first, and if truncated, repairs missing
+    closing quotes, trailing commas, and brackets to salvage valid fields.
+    """
+    # 1. Direct parse attempt
+    try:
+        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        return json.loads(raw_text)
+    except Exception:
+        pass
+
+    # 2. Repair truncated JSON payload
+    try:
+        trimmed = raw_text.strip()
+        # Find opening bracket
+        start_idx = trimmed.find("{")
+        if start_idx != -1:
+            trimmed = trimmed[start_idx:]
+        
+        # Remove trailing dangling characters after the last complete key-value pair
+        last_comma = trimmed.rfind(",")
+        last_brace = trimmed.rfind("}")
+        
+        if last_comma > last_brace:
+            # Cut at the last clean comma and append closing bracket
+            repaired = trimmed[:last_comma] + "\n}"
+            return json.loads(repaired)
+        elif not trimmed.endswith("}"):
+            repaired = trimmed + "\n}"
+            return json.loads(repaired)
+    except Exception as repair_err:
+        logger.warning(f"[JSONRepair] Could not auto-repair truncated JSON: {repair_err}")
+
+    return {}
+
+
+# ==============================================================================
+# Inference Subroutine Helper
+# ==============================================================================
+
+def run_vlm_inference(
+    image: Image.Image,
+    system_prompt: str,
+    ml_state: dict,
+    stage_label: str = "VLM",
+    max_tokens: int = 256
+) -> dict:
     """
     Executes a structured query against the shared in-memory Qwen2-VL model instance
-    with detailed per-stage execution timing and parses the output into a Python dictionary.
+    with stage execution timing and parses the output into a Python dictionary.
 
     :param image: Preprocessed PIL Image instance bounded to 512px.
     :param system_prompt: Guidance text instructing the VLM on expected JSON fields.
     :param ml_state: Shared dictionary holding 'model' and 'processor' instances.
     :param stage_label: Diagnostic label for logging (e.g. 'Passport Bio', 'Visa', etc.).
+    :param max_tokens: Maximum token generation ceiling.
     :return: Extracted key-value dictionary parsed from the model's generated JSON.
     """
     from qwen_vl_utils import process_vision_info
@@ -121,13 +170,12 @@ def run_vlm_inference(image: Image.Image, system_prompt: str, ml_state: dict, st
     if not model or not processor:
         raise RuntimeError("Qwen2-VL model and processor are not loaded in ml_state.")
 
-    # Explicitly pin PyTorch compute threads to prevent thread contention on CPU
+    # Pin PyTorch compute threads to prevent thread contention on CPU
     torch.set_num_threads(settings.torch_cpu_threads)
 
     start_vlm_time = time.perf_counter()
     logger.info(f"[{stage_label}] Preparing prompt tensor inputs (image: {image.size[0]}x{image.size[1]})...")
 
-    # Format user prompt according to Qwen2-VL chat conversation template
     messages = [
         {
             "role": "user",
@@ -135,7 +183,6 @@ def run_vlm_inference(image: Image.Image, system_prompt: str, ml_state: dict, st
                 {
                     "type": "image",
                     "image": image,
-                    # Bound visual tokens strictly between 49 and 144 patches for fast CPU inference
                     "min_pixels": settings.min_pixels,
                     "max_pixels": settings.max_pixels
                 },
@@ -144,11 +191,9 @@ def run_vlm_inference(image: Image.Image, system_prompt: str, ml_state: dict, st
         }
     ]
 
-    # Process prompt template and extract visual input tensors
     text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
 
-    # Build input tensor dictionaries
     inputs = processor(
         text=[text_prompt],
         images=image_inputs,
@@ -157,30 +202,26 @@ def run_vlm_inference(image: Image.Image, system_prompt: str, ml_state: dict, st
         return_tensors="pt"
     )
 
-    # Move tensors to designated execution device (CPU)
     inputs = {k: v.to(settings.device) for k, v in inputs.items()}
 
-    logger.info(f"[{stage_label}] Beginning PyTorch CPU token generation (max_new_tokens={settings.max_new_tokens})...")
+    logger.info(f"[{stage_label}] Beginning PyTorch CPU token generation (max_new_tokens={max_tokens})...")
     gen_start = time.perf_counter()
 
-    # Run deterministic inference without calculating gradients
     with torch.no_grad():
         generated_ids = model.generate(
             **inputs,
-            max_new_tokens=settings.max_new_tokens,
+            max_new_tokens=max_tokens,
             do_sample=False
         )
 
     gen_duration = time.perf_counter() - gen_start
     total_duration = time.perf_counter() - start_vlm_time
 
-    # Separate model-generated response tokens from the input prompt tokens
     generated_ids_trimmed = [
         out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
     ]
     tokens_generated = len(generated_ids_trimmed[0]) if generated_ids_trimmed else 0
 
-    # Decode tokens into UTF-8 string
     raw_text = processor.batch_decode(
         generated_ids_trimmed,
         skip_special_tokens=True,
@@ -192,19 +233,13 @@ def run_vlm_inference(image: Image.Image, system_prompt: str, ml_state: dict, st
         f"({tokens_generated / max(0.01, gen_duration):.1f} tok/s). Total stage latency: {total_duration:.2f}s."
     )
 
-    # Extract JSON string payload bounded by braces
-    try:
-        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
-        if match:
-            parsed_json = json.loads(match.group(0))
-            return parsed_json
-        return json.loads(raw_text)
-    except Exception as parse_err:
+    parsed_result = clean_and_parse_json(raw_text)
+    if not parsed_result:
         logger.warning(
-            f"[{stage_label}] Failed to parse structured JSON from model response: {parse_err}. "
+            f"[{stage_label}] Failed to parse structured JSON from model response. "
             f"Raw text excerpt: {raw_text[:250]}"
         )
-        return {"confidence_note": f"Raw model response: {raw_text}"}
+    return parsed_result
 
 
 # ==============================================================================
@@ -214,11 +249,6 @@ def run_vlm_inference(image: Image.Image, system_prompt: str, ml_state: dict, st
 def normalize_vlm_field(raw_field: Any, default_score: float = 0.80, source: str = "qwen2_vl") -> FieldResult:
     """
     Parses a nested or scalar field returned by Qwen2-VL into a validated FieldResult.
-
-    :param raw_field: Dict containing {'value': ..., 'confidence': ...} or a raw scalar.
-    :param default_score: Default confidence score if none is specified by the model.
-    :param source: Pipeline provenance label.
-    :return: Sanitized FieldResult instance.
     """
     if raw_field is None:
         return FieldResult(value=None, confidence=0.0, source=source)
@@ -253,16 +283,8 @@ def select_best_field(
     notes: list
 ) -> FieldResult:
     """
-    Conducts a head-to-head confidence tournament for a specific field between
-    Tesseract MRZ and Qwen2-VL, selecting the candidate with higher confidence.
-
-    :param field_name: Name of the target field for diagnostic logging.
-    :param cand_mrz: Extraction result produced by Tesseract MRZ.
-    :param cand_vlm: Extraction result produced by Qwen2-VL.
-    :param notes: In-out list collecting execution notes.
-    :return: Winning FieldResult.
+    Conducts a head-to-head confidence tournament between Tesseract MRZ and Qwen2-VL.
     """
-    # If one candidate has no value, automatically choose the other
     if cand_mrz.value and not cand_vlm.value:
         return cand_mrz
     if cand_vlm.value and not cand_mrz.value:
@@ -270,7 +292,6 @@ def select_best_field(
     if not cand_mrz.value and not cand_vlm.value:
         return FieldResult(value=None, confidence=0.0, source="unassigned")
 
-    # Both have values: compare confidence scores
     if cand_mrz.confidence >= cand_vlm.confidence:
         winning = cand_mrz
         notes.append(
@@ -285,25 +306,15 @@ def select_best_field(
     return winning
 
 
-# ==============================================================================
-# Dynamic Document Discovery Helper
-# ==============================================================================
-
 def refresh_document_paths(job_id: str) -> Dict[str, str]:
     """
-    Queries SQLite and inspects the on-disk job directory to discover any files
-    attached after the initial job ingestion. Guarantees that documents uploaded
-    while previous stages were executing are never missed.
-
-    :param job_id: UUID tracking string.
-    :return: Fresh mapping of document types to verified local file paths.
+    Queries SQLite and inspects the on-disk job directory to discover attached files.
     """
     job_record = get_job(job_id)
     doc_paths: Dict[str, str] = job_record.get("doc_paths", {}) if job_record else {}
 
     job_dir = os.path.join(BASE_STORAGE_DIR, job_id)
     if os.path.isdir(job_dir):
-        # Scan filesystem for standard attachment prefix names
         for filename in os.listdir(job_dir):
             full_path = os.path.join(job_dir, filename)
             if not os.path.isfile(full_path):
@@ -314,7 +325,7 @@ def refresh_document_paths(job_id: str) -> Dict[str, str]:
                 doc_paths["visa_page"] = full_path
             elif filename.startswith("stamp_") and "entry_stamp" not in doc_paths:
                 doc_paths["entry_stamp"] = full_path
-            elif filename.startswith("form_") and "welcome_form" not in doc_paths:
+            elif filename.startswith("welcome_") and "welcome_form" not in doc_paths:
                 doc_paths["welcome_form"] = full_path
 
     return doc_paths
@@ -327,13 +338,7 @@ def refresh_document_paths(job_id: str) -> Dict[str, str]:
 async def process_single_job(job_id: str, ml_state: dict) -> None:
     """
     Executes the multi-document extraction pipeline for a single queued job.
-    Runs Tesseract MRZ and Qwen2-VL for the bio page, selects the
-    best candidate per field, and continues through Visa, Stamp, and Welcome Form.
-    Progressively persists extraction state to SQLite after each stage so mobile
-    clients receive real-time updates as stages complete.
-
-    :param job_id: Unique UUID string identifier of the target job.
-    :param ml_state: Shared dictionary holding model handles.
+    Progressively persists extraction state to SQLite after each stage.
     """
     job_start_time = time.perf_counter()
     logger.info(f"[*] Starting extraction pipeline for job: {job_id}")
@@ -352,7 +357,7 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
         if bio_path and os.path.exists(bio_path):
             logger.info(f"[{job_id}] Stage 1/4: Dual-engine extraction for passport bio page ({bio_path})...")
 
-            # --- Engine A: Tesseract MRZ Execution ---
+            # --- Engine A: Tesseract MRZ ---
             mrz_start = time.perf_counter()
             mrz_candidates: Dict[str, FieldResult] = {}
             valid_mrz_flag = False
@@ -416,9 +421,8 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                 logger.warning(f"[{job_id}] MRZ extraction error: {str(mrz_exc)}", exc_info=True)
                 processing_notes.append(f"MRZ error: {str(mrz_exc)}")
 
-            # --- Engine B: Qwen2-VL Visual Bio Execution ---
+            # --- Engine B: Qwen2-VL Visual Bio ---
             vlm_candidates: Dict[str, FieldResult] = {}
-            # Preprocess image downscaled to settings.max_image_dimension (512px)
             bio_image = await asyncio.to_thread(load_and_preprocess_image, bio_path)
 
             if bio_image:
@@ -437,19 +441,19 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                     '  "confidence_note": "short explanation of image quality"\n'
                     "}"
                 )
-                vlm_bio = await asyncio.to_thread(run_vlm_inference, bio_image, bio_prompt, ml_state, "Passport Bio VLM")
+                vlm_bio = await asyncio.to_thread(run_vlm_inference, bio_image, bio_prompt, ml_state, "Passport Bio VLM", 256)
 
-                vlm_candidates["surname"] = normalize_vlm_field(vlm_bio.get("surname"))
-                vlm_candidates["given_names"] = normalize_vlm_field(vlm_bio.get("given_names"))
-                vlm_candidates["passport_number"] = normalize_vlm_field(vlm_bio.get("passport_number"))
-                vlm_candidates["nationality"] = normalize_vlm_field(vlm_bio.get("nationality"))
-                vlm_candidates["date_of_birth"] = normalize_vlm_field(vlm_bio.get("date_of_birth"))
-                vlm_candidates["sex"] = normalize_vlm_field(vlm_bio.get("sex"))
-                vlm_candidates["passport_expiry_date"] = normalize_vlm_field(vlm_bio.get("expiry_date"))
+                vlm_candidates["surname"] = normalize_vlm_field(vlm_bio.get("surname"), source="passport_bio_vlm")
+                vlm_candidates["given_names"] = normalize_vlm_field(vlm_bio.get("given_names"), source="passport_bio_vlm")
+                vlm_candidates["passport_number"] = normalize_vlm_field(vlm_bio.get("passport_number"), source="passport_bio_vlm")
+                vlm_candidates["nationality"] = normalize_vlm_field(vlm_bio.get("nationality"), source="passport_bio_vlm")
+                vlm_candidates["date_of_birth"] = normalize_vlm_field(vlm_bio.get("date_of_birth"), source="passport_bio_vlm")
+                vlm_candidates["sex"] = normalize_vlm_field(vlm_bio.get("sex"), source="passport_bio_vlm")
+                vlm_candidates["passport_expiry_date"] = normalize_vlm_field(vlm_bio.get("expiry_date"), source="passport_bio_vlm")
 
                 processing_notes.append("Qwen2-VL visual bio extraction completed.")
 
-            # --- Engine Tournament: Select Best Field for Every Bio Attribute ---
+            # --- Engine Tournament ---
             empty_field = FieldResult(value=None, confidence=0.0, source="none")
             fused_record.valid_mrz = valid_mrz_flag
 
@@ -512,7 +516,6 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
 
         if visa_path and os.path.exists(visa_path):
             logger.info(f"[{job_id}] Stage 2/4: Running Qwen2-VL visa extraction ({visa_path})...")
-            # Downscale image to 512px
             visa_image = await asyncio.to_thread(load_and_preprocess_image, visa_path)
             if visa_image:
                 visa_prompt = (
@@ -526,12 +529,12 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                     '  "place_of_issue": {"value": "...", "confidence": 0.85}\n'
                     "}"
                 )
-                vlm_visa = await asyncio.to_thread(run_vlm_inference, visa_image, visa_prompt, ml_state, "Visa VLM")
-                fused_record.visa_number = normalize_vlm_field(vlm_visa.get("visa_number"))
-                fused_record.visa_type = normalize_vlm_field(vlm_visa.get("visa_type"))
-                fused_record.visa_issue_date = normalize_vlm_field(vlm_visa.get("issue_date"))
-                fused_record.visa_expiry_date = normalize_vlm_field(vlm_visa.get("expiry_date"))
-                fused_record.visa_place_of_issue = normalize_vlm_field(vlm_visa.get("place_of_issue"))
+                vlm_visa = await asyncio.to_thread(run_vlm_inference, visa_image, visa_prompt, ml_state, "Visa VLM", 256)
+                fused_record.visa_number = normalize_vlm_field(vlm_visa.get("visa_number"), source="visa_vlm")
+                fused_record.visa_type = normalize_vlm_field(vlm_visa.get("visa_type"), source="visa_vlm")
+                fused_record.visa_issue_date = normalize_vlm_field(vlm_visa.get("issue_date"), source="visa_vlm")
+                fused_record.visa_expiry_date = normalize_vlm_field(vlm_visa.get("expiry_date"), source="visa_vlm")
+                fused_record.visa_place_of_issue = normalize_vlm_field(vlm_visa.get("place_of_issue"), source="visa_vlm")
                 processing_notes.append("Visa / OCI details extracted via Qwen2-VL.")
 
                 # Persist Stage 2 intermediate progress to SQLite immediately
@@ -549,7 +552,6 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
 
         if stamp_path and os.path.exists(stamp_path):
             logger.info(f"[{job_id}] Stage 3/4: Running Qwen2-VL entry stamp extraction ({stamp_path})...")
-            # Downscale image to 512px
             stamp_image = await asyncio.to_thread(load_and_preprocess_image, stamp_path)
             if stamp_image:
                 stamp_prompt = (
@@ -560,9 +562,9 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                     '  "arrival_port": {"value": "...", "confidence": 0.85}\n'
                     "}"
                 )
-                vlm_stamp = await asyncio.to_thread(run_vlm_inference, stamp_image, stamp_prompt, ml_state, "Stamp VLM")
-                fused_record.arrival_date_india = normalize_vlm_field(vlm_stamp.get("arrival_date"))
-                fused_record.arrival_port_india = normalize_vlm_field(vlm_stamp.get("arrival_port"))
+                vlm_stamp = await asyncio.to_thread(run_vlm_inference, stamp_image, stamp_prompt, ml_state, "Stamp VLM", 256)
+                fused_record.arrival_date_india = normalize_vlm_field(vlm_stamp.get("arrival_date"), source="stamp_vlm")
+                fused_record.arrival_port_india = normalize_vlm_field(vlm_stamp.get("arrival_port"), source="stamp_vlm")
                 processing_notes.append("Entry stamp details extracted via Qwen2-VL.")
 
                 # Persist Stage 3 intermediate progress to SQLite immediately
@@ -580,16 +582,14 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
 
         if welcome_path and os.path.exists(welcome_path):
             logger.info(f"[{job_id}] Stage 4/4: Running Qwen2-VL handwritten Form-C extraction ({welcome_path})...")
-            # Downscale image to 512px
             welcome_image = await asyncio.to_thread(load_and_preprocess_image, welcome_path)
             if welcome_image:
                 # Targeted prompt structured exactly around the 12 numbered rows of FORM C (RULE 14)
                 welcome_prompt = (
-                    "This image is a printed ARRIVAL REPORT table (THE REGISTRATION OF FOREIGNERS RULES 1939 FORM C RULE 14) "
-                    "containing handwritten guest entries. "
+                    "This image is a printed ARRIVAL REPORT table (FORM C RULE 14) containing handwritten guest entries. "
                     "Locate each numbered row and transcribe the text entered to the right or below each printed label:\n"
                     "Row 1: 'Name of foreigner (Surname First)'\n"
-                    "Row 2: 'Full Address' (permanent home street address), with sub-labels: 'City', 'Country', 'E-mail', and 'Telphone / Mobile'\n"
+                    "Row 2: 'Full Address' (permanent home street address), with sub-labels: 'City', 'Country', 'E-mail', and 'Telephone / Mobile'\n"
                     "Row 3: 'Nationality'\n"
                     "Row 4: 'Place of issue of visa'\n"
                     "Row 5: 'Date of Arrival in India' (YYYY-MM-DD or as written)\n"
@@ -600,7 +600,7 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                     "Row 10: 'Purpose of visit & your Profession'\n"
                     "Row 11: 'Expected date of departure (from here)'\n"
                     "Row 12: 'Country & city you arrived to India'\n\n"
-                    "If a line is blank or not legible, use null for value and 0.0 for confidence. "
+                    "If a line is blank or illegible, use null for value and 0.0 for confidence. "
                     "If handwriting or text is present, extract it and assign a confidence between 0.50 and 1.0.\n"
                     "Return ONLY valid JSON matching this exact structure:\n"
                     "{\n"
@@ -622,7 +622,8 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                     '  "country_city_arrived_to_india": {"value": null, "confidence": 0.0}\n'
                     "}"
                 )
-                vlm_form = await asyncio.to_thread(run_vlm_inference, welcome_image, welcome_prompt, ml_state, "Welcome Form VLM")
+                # Allocate 512 max tokens so the entire 12-row JSON payload completes without cutting off
+                vlm_form = await asyncio.to_thread(run_vlm_inference, welcome_image, welcome_prompt, ml_state, "Welcome Form VLM", 512)
 
                 # Map extracted Form-C items into fused record with source attribution
                 fused_record.permanent_address = normalize_vlm_field(vlm_form.get("full_address"), source="welcome_form")
@@ -673,8 +674,6 @@ async def background_queue_worker(ml_state: dict) -> None:
     """
     Continuous background loop that waits for jobs added to job_queue
     and processes them sequentially one after another.
-
-    :param ml_state: Global dictionary containing warm Qwen2-VL model handles.
     """
     logger.info("[*] Background async queue worker loop initialized.")
     while True:
