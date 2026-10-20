@@ -10,9 +10,10 @@
 # - Applies EXIF transposition to correct camera orientation tags.
 # - High-confidence OSD thresholding: Ignores low-confidence (< 2.0) or non-Latin OSD false positives.
 # - Neutral administrative archival prompts preventing safety refusal triggers.
+# - Explicit header separation: Distinguishes pre-printed homestay letterhead from guest residential address.
 # - Dynamic visual token bounding respecting per-stage patch ceilings.
 # - High-definition visual patch allocation for fine cursive handwriting.
-# - OCR-Assisted Grounding: Supplies raw native Tesseract text tokens as context hints to Qwen2-VL.
+# - OCR-Assisted Grounding: Supplies full localized Tesseract tokens as context hints to Qwen2-VL.
 # - Row-Anchored Form-C Slices: Explicitly anchors rows 1-5 (Pass 4A) and rows 6-12 (Pass 4B).
 # - Resilient Queue Ingestion: Safely handles both raw UUID strings and startup recovery dicts.
 # ==============================================================================
@@ -710,21 +711,23 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                 try:
                     ocr_top_raw = await asyncio.to_thread(pytesseract.image_to_string, welcome_top_img)
                     ocr_top_lines = [line.strip() for line in ocr_top_raw.splitlines() if line.strip()]
-                    ocr_top_text = "\n".join(ocr_top_lines[:20])
+                    ocr_top_text = "\n".join(ocr_top_lines)
                 except Exception as e:
                     ocr_top_text = "No OCR hints available."
 
                 welcome_top_prompt = (
                     "You are an administrative office assistant digitizing the top section (Rows 1 to 5) of an official Form C (Rule 14) Arrival Report homestay registration card.\n"
+                    "CRITICAL: The card contains pre-printed header letterhead at the top ('HOMESTED, 1386 A, PARVATHY NILAYAM, THAMARAKULAM ROAD, KOCHI'). IGNORE that homestay header completely.\n"
+                    "Extract ONLY the foreigner guest's handwritten entries in Rows 1 to 5.\n\n"
                     "Here are raw OCR character tokens detected on this top section:\n"
                     f"\"\"\"\n{ocr_top_text}\n\"\"\"\n\n"
-                    "Examine the image rows:\n"
+                    "Examine the numbered rows on the card:\n"
                     "- Row 1: Name of foreigner (Surname First)\n"
-                    "- Row 2: Full Address, City, Country, E-mail, Telephone / Mobile\n"
+                    "- Row 2: Full Address (handwritten residential street/town in their home country), City, Country, E-mail, Telephone / Mobile\n"
                     "- Row 3: Nationality\n"
                     "- Row 4: Place of issue of visa\n"
                     "- Row 5: Date of Arrival in India\n\n"
-                    "Transcribe the handwritten entries into this JSON schema:\n"
+                    "Transcribe the genuine handwriting into this JSON schema:\n"
                     "{\n"
                     '  "name_of_foreigner": {"value": string or null, "confidence": float},\n'
                     '  "full_address": {"value": string or null, "confidence": float},\n'
@@ -737,7 +740,7 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     '  "date_of_arrival_in_india": {"value": "YYYY-MM-DD" or null, "confidence": float}\n'
                     "}\n"
                     "Instructions:\n"
-                    "- Transcribe genuine handwriting written on this card.\n"
+                    "- full_address, city, and country MUST be the foreigner's permanent home address written by hand, NOT the Indian homestay address.\n"
                     "- If a line is blank or empty, return null for value and 0.0 for confidence.\n"
                     "- Output JSON only."
                 )
@@ -782,28 +785,28 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
 
                 # ------------------------------------------------------------------
                 # Pass 4B: Bottom Section (Rows 6 to 12: Homestay Arrival, Travel & Stay Dates)
-                # Crop bottom 52% of the document to capture rows 6 through 12 cleanly
+                # Crop bottom 58% of the document (from 0.42 * img_h to img_h) to cleanly capture rows 6 to 12
                 # ------------------------------------------------------------------
-                bottom_crop_box = (0, int(img_h * 0.48), img_w, img_h)
+                bottom_crop_box = (0, int(img_h * 0.42), img_w, img_h)
                 welcome_bottom_img = welcome_raw.crop(bottom_crop_box)
                 logger.info(f"[{job_id}] Pass 4B: Cropped bottom section ({img_w}x{welcome_bottom_img.size[1]}).")
 
-                # Run fast local OCR specifically on the bottom crop
+                # Run fast local OCR specifically on the bottom crop and provide all detected cues
                 ocr_bottom_text = ""
                 try:
                     ocr_bottom_raw = await asyncio.to_thread(pytesseract.image_to_string, welcome_bottom_img)
                     ocr_bottom_lines = [line.strip() for line in ocr_bottom_raw.splitlines() if line.strip()]
-                    ocr_bottom_text = "\n".join(ocr_bottom_lines[:20])
+                    ocr_bottom_text = "\n".join(ocr_bottom_lines)
                 except Exception as e:
                     ocr_bottom_text = "No OCR hints available."
 
                 welcome_bottom_prompt = (
                     "You are an administrative office assistant digitizing the bottom section (Rows 6 to 12) of an official Form C (Rule 14) Arrival Report homestay registration card.\n"
-                    "Here are raw OCR character tokens detected on this bottom section:\n"
+                    "Here are raw OCR character tokens detected on this bottom section to guide your reading:\n"
                     f"\"\"\"\n{ocr_bottom_text}\n\"\"\"\n\n"
                     "Examine the numbered table rows on this slip:\n"
-                    "- Row 6: Date and Time of Arrival in the home stay\n"
-                    "- Row 7: Arrived from\n"
+                    "- Row 6: Date and Time of Arrival in the home stay (e.g., date and time like '09.10.16 18:00')\n"
+                    "- Row 7: Arrived from (e.g., state or city like 'KERALA')\n"
                     "- Row 8: Proceeding to (from here)\n"
                     "- Row 9: Proposed duration of stay in India\n"
                     "- Row 10: Purpose of visit & your Profession\n"
@@ -821,7 +824,7 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     "}\n"
                     "Instructions:\n"
                     "- Transcribe only genuine handwriting written on these rows.\n"
-                    "- If a line is blank or empty, return null for value and 0.0 for confidence.\n"
+                    "- If a row is blank or empty, return null for value and 0.0 for confidence.\n"
                     "- Output JSON only."
                 )
 
