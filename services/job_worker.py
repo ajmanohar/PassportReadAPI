@@ -13,6 +13,7 @@
 # - Dynamic visual token bounding respecting per-stage patch ceilings.
 # - High-definition visual patch allocation for fine cursive handwriting.
 # - OCR-Assisted Grounding: Supplies raw Tesseract text tokens as context hints to Qwen2-VL.
+# - Resilient Queue Ingestion: Safely handles both raw UUID strings and startup recovery dicts.
 # ==============================================================================
 
 import asyncio
@@ -22,7 +23,7 @@ import logging
 import os
 import re
 import time
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 
 from PIL import Image, ImageOps
 import pytesseract
@@ -38,7 +39,7 @@ from schemas.job import GuestFormCRecord, FieldResult
 logger = logging.getLogger("job_worker")
 logger.setLevel(logging.INFO)
 
-# Global in-memory queue holding job UUID strings for sequential execution by the worker loop
+# Global in-memory queue holding job tracking identifiers for sequential execution by the worker loop
 job_queue: asyncio.Queue = asyncio.Queue()
 
 # Base disk directory for persisting uploaded document images during asynchronous processing
@@ -408,15 +409,25 @@ def refresh_document_paths(job_id: str) -> Dict[str, str]:
 # Job Processing Pipeline
 # ==============================================================================
 
-async def process_single_job(job_id: str, ml_state: dict) -> None:
+async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: dict) -> None:
     """
     Executes the multi-document extraction pipeline for a single queued job.
     Uses neutral administrative framing, high-definition visual patches, and
     OCR-assisted hints on Form-C to decipher cursive handwriting.
 
-    :param job_id: Unique UUID string identifier of the target job.
+    :param job_input: Either a UUID string or a recovered dictionary holding 'job_id'.
     :param ml_state: Shared dictionary holding model handles.
     """
+    # Defensive unwrapping: Extract UUID string if a dictionary was passed from startup recovery
+    if isinstance(job_input, dict):
+        job_id = str(job_input.get("job_id", "")).strip()
+    else:
+        job_id = str(job_input).strip()
+
+    if not job_id:
+        logger.error("[!] Dispatched empty or invalid job identifier to process_single_job.")
+        return
+
     job_start_time = time.perf_counter()
     logger.info(f"[*] Starting extraction pipeline for job: {job_id}")
     update_job_status(job_id, "PROCESSING")
@@ -834,13 +845,26 @@ async def background_queue_worker(ml_state: dict) -> None:
     """
     Continuous background loop that waits for jobs added to job_queue
     and processes them sequentially one after another.
+    Safely unwraps both UUID string inputs and dictionary records from startup recovery.
 
     :param ml_state: Global dictionary containing warm Qwen2-VL model handles.
     """
     logger.info("[*] Background async queue worker loop initialized.")
     while True:
         try:
-            job_id = await job_queue.get()
+            job_item = await job_queue.get()
+            
+            # Defensive unwrap: Extract job_id whether item is a string or dictionary
+            if isinstance(job_item, dict):
+                job_id = str(job_item.get("job_id", "")).strip()
+            else:
+                job_id = str(job_item).strip()
+
+            if not job_id:
+                logger.warning(f"[*] Queue received invalid job item: {job_item}. Skipping.")
+                job_queue.task_done()
+                continue
+
             logger.info(f"[*] Queue dispatched job: {job_id}")
 
             await process_single_job(job_id, ml_state)
