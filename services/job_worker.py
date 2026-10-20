@@ -13,6 +13,7 @@
 # - Dynamic visual token bounding respecting per-stage patch ceilings.
 # - High-definition visual patch allocation for fine cursive handwriting.
 # - OCR-Assisted Grounding: Supplies raw native Tesseract text tokens as context hints to Qwen2-VL.
+# - Row-Anchored Form-C Slices: Explicitly anchors rows 1-5 (Pass 4A) and rows 6-12 (Pass 4B).
 # - Resilient Queue Ingestion: Safely handles both raw UUID strings and startup recovery dicts.
 # ==============================================================================
 
@@ -694,32 +695,36 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
             welcome_raw = await asyncio.to_thread(load_and_preprocess_image, welcome_path)
             
             if welcome_raw:
-                # Run rapid local Tesseract OCR to obtain raw candidate lines as ground truth cues
-                ocr_start = time.perf_counter()
-                try:
-                    raw_ocr_text = await asyncio.to_thread(pytesseract.image_to_string, welcome_raw)
-                    ocr_lines = [line.strip() for line in raw_ocr_text.splitlines() if line.strip()]
-                    ocr_summary = "\n".join(ocr_lines[:30])
-                    logger.info(f"[{job_id}] Fast OCR character scan finished in {(time.perf_counter() - ocr_start):.2f}s ({len(ocr_lines)} lines).")
-                except Exception as ocr_e:
-                    logger.warning(f"[{job_id}] Fast OCR scan skipped: {ocr_e}")
-                    ocr_summary = "No OCR hints available."
-
                 img_w, img_h = welcome_raw.size
 
                 # ------------------------------------------------------------------
-                # Pass 4A: Top Section (Personal Identity, Residence & Contact Info)
-                # Crop top 58% of the document to include address, email, phone, and visa
+                # Pass 4A: Top Section (Rows 1 to 5: Identity, Residence, Visa, Arrival)
+                # Crop top 52% of the document
                 # ------------------------------------------------------------------
-                top_crop_box = (0, 0, img_w, int(img_h * 0.58))
+                top_crop_box = (0, 0, img_w, int(img_h * 0.52))
                 welcome_top_img = welcome_raw.crop(top_crop_box)
                 logger.info(f"[{job_id}] Pass 4A: Cropped top section ({img_w}x{welcome_top_img.size[1]}).")
 
+                # Run fast local OCR specifically on the top crop to get ground-truth tokens
+                ocr_top_text = ""
+                try:
+                    ocr_top_raw = await asyncio.to_thread(pytesseract.image_to_string, welcome_top_img)
+                    ocr_top_lines = [line.strip() for line in ocr_top_raw.splitlines() if line.strip()]
+                    ocr_top_text = "\n".join(ocr_top_lines[:20])
+                except Exception as e:
+                    ocr_top_text = "No OCR hints available."
+
                 welcome_top_prompt = (
-                    "You are an administrative office assistant digitizing the top section of an official Form C (Rule 14) Arrival Report homestay registration card.\n"
-                    "Here are raw OCR character tokens detected on this form to assist your reading:\n"
-                    f"\"\"\"\n{ocr_summary}\n\"\"\"\n\n"
-                    "Using both the visual image and the OCR tokens as reference, transcribe the handwritten entries into this JSON schema:\n"
+                    "You are an administrative office assistant digitizing the top section (Rows 1 to 5) of an official Form C (Rule 14) Arrival Report homestay registration card.\n"
+                    "Here are raw OCR character tokens detected on this top section:\n"
+                    f"\"\"\"\n{ocr_top_text}\n\"\"\"\n\n"
+                    "Examine the image rows:\n"
+                    "- Row 1: Name of foreigner (Surname First)\n"
+                    "- Row 2: Full Address, City, Country, E-mail, Telephone / Mobile\n"
+                    "- Row 3: Nationality\n"
+                    "- Row 4: Place of issue of visa\n"
+                    "- Row 5: Date of Arrival in India\n\n"
+                    "Transcribe the handwritten entries into this JSON schema:\n"
                     "{\n"
                     '  "name_of_foreigner": {"value": string or null, "confidence": float},\n'
                     '  "full_address": {"value": string or null, "confidence": float},\n'
@@ -732,9 +737,8 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     '  "date_of_arrival_in_india": {"value": "YYYY-MM-DD" or null, "confidence": float}\n'
                     "}\n"
                     "Instructions:\n"
-                    "- Transcribe the genuine handwriting written on this card.\n"
+                    "- Transcribe genuine handwriting written on this card.\n"
                     "- If a line is blank or empty, return null for value and 0.0 for confidence.\n"
-                    "- Never invent or hallucinate dummy data.\n"
                     "- Output JSON only."
                 )
 
@@ -777,18 +781,35 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                 save_intermediate_job_result(job_id, fused_record.model_dump())
 
                 # ------------------------------------------------------------------
-                # Pass 4B: Bottom Section (Homestay Arrival, Travel & Stay Dates)
-                # Crop bottom 55% of the document to include arrival time, duration, purpose, departure
+                # Pass 4B: Bottom Section (Rows 6 to 12: Homestay Arrival, Travel & Stay Dates)
+                # Crop bottom 52% of the document to capture rows 6 through 12 cleanly
                 # ------------------------------------------------------------------
-                bottom_crop_box = (0, int(img_h * 0.45), img_w, img_h)
+                bottom_crop_box = (0, int(img_h * 0.48), img_w, img_h)
                 welcome_bottom_img = welcome_raw.crop(bottom_crop_box)
                 logger.info(f"[{job_id}] Pass 4B: Cropped bottom section ({img_w}x{welcome_bottom_img.size[1]}).")
 
+                # Run fast local OCR specifically on the bottom crop
+                ocr_bottom_text = ""
+                try:
+                    ocr_bottom_raw = await asyncio.to_thread(pytesseract.image_to_string, welcome_bottom_img)
+                    ocr_bottom_lines = [line.strip() for line in ocr_bottom_raw.splitlines() if line.strip()]
+                    ocr_bottom_text = "\n".join(ocr_bottom_lines[:20])
+                except Exception as e:
+                    ocr_bottom_text = "No OCR hints available."
+
                 welcome_bottom_prompt = (
-                    "You are an administrative office assistant digitizing the bottom section of an official Form C (Rule 14) Arrival Report homestay registration card.\n"
-                    "Here are raw OCR character tokens detected on this form to assist your reading:\n"
-                    f"\"\"\"\n{ocr_summary}\n\"\"\"\n\n"
-                    "Using both the visual image and the OCR tokens as reference, transcribe the handwritten entries into this JSON schema:\n"
+                    "You are an administrative office assistant digitizing the bottom section (Rows 6 to 12) of an official Form C (Rule 14) Arrival Report homestay registration card.\n"
+                    "Here are raw OCR character tokens detected on this bottom section:\n"
+                    f"\"\"\"\n{ocr_bottom_text}\n\"\"\"\n\n"
+                    "Examine the numbered table rows on this slip:\n"
+                    "- Row 6: Date and Time of Arrival in the home stay\n"
+                    "- Row 7: Arrived from\n"
+                    "- Row 8: Proceeding to (from here)\n"
+                    "- Row 9: Proposed duration of stay in India\n"
+                    "- Row 10: Purpose of visit & your Profession\n"
+                    "- Row 11: Expected date of departure (from here)\n"
+                    "- Row 12: Country & city you arrived to India\n\n"
+                    "Transcribe the genuine handwriting written into each row into this JSON schema:\n"
                     "{\n"
                     '  "datetime_arrival_homestay": {"value": string or null, "confidence": float},\n'
                     '  "arrived_from": {"value": string or null, "confidence": float},\n'
@@ -799,9 +820,8 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     '  "country_city_arrived_to_india": {"value": string or null, "confidence": float}\n'
                     "}\n"
                     "Instructions:\n"
-                    "- Transcribe the genuine handwriting written on this card.\n"
+                    "- Transcribe only genuine handwriting written on these rows.\n"
                     "- If a line is blank or empty, return null for value and 0.0 for confidence.\n"
-                    "- Never invent or hallucinate dummy data.\n"
                     "- Output JSON only."
                 )
 
