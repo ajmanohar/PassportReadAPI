@@ -6,11 +6,12 @@
 # Executes an unconditional 'best-of-both' confidence tournament between Tesseract MRZ and
 # Qwen2-VL for the Passport Bio page, selecting the highest-confidence extraction per field.
 #
-# Anti-Hallucination Controls:
-# - Literal-only prompts: Model is strictly forbidden from guessing, inferring, or extrapolating.
-# - Explicit prohibitions against calculating expiry dates from issue dates.
-# - Mandatory null assignment for unwritten, blank, or illegible fields.
-# - Expanded sanitizer blacklist blocking synthetic locations, emails, and dates.
+# Anti-Hallucination & Legibility Architecture:
+# - Neutral administrative archival prompts: Prevents PII safety refusal triggers.
+# - Strict literal transcription: Explicitly forbids inferring, calculating, or inventing dates/places.
+# - Two-pass sectional reading for Form-C: Splits the sheet into Top (personal/contact) and
+#   Bottom (stay/travel) sections, halving the visual attention area and doubling pixel legibility.
+# - High-definition visual patch allocation for handwriting without exceeding CPU memory bounds.
 # ==============================================================================
 
 import asyncio
@@ -41,18 +42,15 @@ job_queue: asyncio.Queue = asyncio.Queue()
 # Base disk directory for persisting uploaded document images during asynchronous processing
 BASE_STORAGE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "storage", "jobs")
 
-# Blacklist of known hallucination tokens and synthetic placeholders to reject at normalization
+# Blacklist of known synthetic placeholder tokens to reject at field normalization
 FORBIDDEN_HALLUCINATIONS: List[str] = [
     "parthasarthy",
     "parthasarathy",
-    "chennai",
     "example@domain.com",
     "9876543210",
     "dummy",
     "lorem ipsum",
-    "john.doe",
-    "kanpur airport",
-    "kanpur"
+    "john.doe"
 ]
 
 
@@ -62,8 +60,8 @@ FORBIDDEN_HALLUCINATIONS: List[str] = [
 
 def sanitize_extracted_string(val: Optional[str]) -> Optional[str]:
     """
-    Sanitizes extracted text to prevent dummy, hallucinated, or placeholder strings from persisting.
-    If the value contains known hallucination tokens or generic placeholders, returns None.
+    Sanitizes extracted text to prevent dummy or placeholder strings from persisting.
+    If the value contains known placeholder tokens or empty strings, returns None.
 
     :param val: Raw string extracted from VLM or OCR.
     :return: Sanitized string, or None if rejected.
@@ -78,7 +76,7 @@ def sanitize_extracted_string(val: Optional[str]) -> Optional[str]:
     val_lower = val_clean.lower()
     for bad_token in FORBIDDEN_HALLUCINATIONS:
         if bad_token in val_lower:
-            logger.warning(f"[Sanitizer] Blocked hallucinated dummy string containing '{bad_token}': {val_clean}")
+            logger.warning(f"[Sanitizer] Blocked synthetic placeholder string containing '{bad_token}': {val_clean}")
             return None
             
     return val_clean
@@ -94,7 +92,7 @@ def load_and_preprocess_image(
 ) -> Optional[Image.Image]:
     """
     Loads an image from disk storage, standardizes color channels to RGB,
-    and downscales proportionally if the maximum dimension exceeds configured limits.
+    and scales proportionally if the maximum dimension exceeds configured limits.
 
     :param file_path: Absolute or relative filesystem path to the image file.
     :param max_dimension: Maximum allowed width or height in pixels. Defaults to settings.max_image_dimension.
@@ -116,7 +114,7 @@ def load_and_preprocess_image(
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        # Downscale proportionally to bound attention matrix computation while preserving sharp text
+        # Downscale proportionally if larger than configured ceiling
         if max(orig_w, orig_h) > target_max_dim:
             image.thumbnail((target_max_dim, target_max_dim), Image.Resampling.LANCZOS)
             new_w, new_h = image.size
@@ -145,17 +143,21 @@ def run_vlm_inference(
     system_prompt: str,
     ml_state: dict,
     stage_label: str = "VLM",
-    max_tokens_override: Optional[int] = None
+    max_tokens_override: Optional[int] = None,
+    min_pixels_override: Optional[int] = None,
+    max_pixels_override: Optional[int] = None
 ) -> dict:
     """
     Executes a structured query against the shared in-memory Qwen2-VL model instance
-    with deterministic greedy decoding and strict JSON parsing.
+    with deterministic greedy decoding, custom visual patch allocations, and strict JSON parsing.
 
-    :param image: Preprocessed PIL Image instance.
+    :param image: Preprocessed PIL Image instance or cropped section.
     :param system_prompt: Guidance text instructing the VLM on expected JSON fields.
     :param ml_state: Shared dictionary holding 'model' and 'processor' instances.
     :param stage_label: Diagnostic label for logging (e.g. 'Passport Bio', 'Visa', etc.).
-    :param max_tokens_override: Optional integer to override default max_new_tokens for dense forms.
+    :param max_tokens_override: Optional integer to override default max_new_tokens.
+    :param min_pixels_override: Optional visual patch floor in pixels.
+    :param max_pixels_override: Optional visual patch ceiling in pixels.
     :return: Extracted key-value dictionary parsed from the model's generated JSON.
     """
     from qwen_vl_utils import process_vision_info
@@ -169,8 +171,15 @@ def run_vlm_inference(
     # Explicitly pin PyTorch compute threads to physical CPU cores
     torch.set_num_threads(settings.torch_cpu_threads)
 
+    # Determine visual patch boundaries
+    effective_min_pixels = min_pixels_override if min_pixels_override is not None else settings.min_pixels
+    effective_max_pixels = max_pixels_override if max_pixels_override is not None else settings.max_pixels
+
     start_vlm_time = time.perf_counter()
-    logger.info(f"[{stage_label}] Preparing prompt tensor inputs (image: {image.size[0]}x{image.size[1]})...")
+    logger.info(
+        f"[{stage_label}] Preparing prompt tensor inputs (image: {image.size[0]}x{image.size[1]}, "
+        f"patches: {effective_min_pixels}-{effective_max_pixels}px)..."
+    )
 
     # Format user prompt according to Qwen2-VL chat conversation template
     messages = [
@@ -180,8 +189,8 @@ def run_vlm_inference(
                 {
                     "type": "image",
                     "image": image,
-                    "min_pixels": settings.min_pixels,
-                    "max_pixels": settings.max_pixels
+                    "min_pixels": effective_min_pixels,
+                    "max_pixels": effective_max_pixels
                 },
                 {"type": "text", "text": system_prompt}
             ]
@@ -263,12 +272,12 @@ def run_vlm_inference(
 
 def normalize_vlm_field(
     raw_field: Any,
-    default_score: float = 0.80,
+    default_score: float = 0.85,
     source: str = "qwen2_vl"
 ) -> FieldResult:
     """
     Parses a field returned by Qwen2-VL into a validated FieldResult.
-    Sanitizes against dummy strings and hallucinated tokens.
+    Sanitizes against dummy strings and synthetic placeholder tokens.
 
     :param raw_field: Dict containing {'value': ..., 'confidence': ...} or a raw scalar.
     :param default_score: Default confidence score if none is specified by the model.
@@ -374,7 +383,8 @@ def refresh_document_paths(job_id: str) -> Dict[str, str]:
 async def process_single_job(job_id: str, ml_state: dict) -> None:
     """
     Executes the multi-document extraction pipeline for a single queued job.
-    Uses strict, literal-only zero-shot prompts to prevent hallucinations.
+    Uses neutral administrative framing and two-pass sectional extraction on Form-C
+    to prevent safety refusals and maximize legibility.
 
     :param job_id: Unique UUID string identifier of the target job.
     :param ml_state: Shared dictionary holding model handles.
@@ -468,10 +478,8 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
 
             if bio_image:
                 bio_prompt = (
-                    "You are a strict, literal OCR engine. Read the passport bio page image.\n"
-                    "Extract ONLY the printed text visible on the document.\n"
-                    "If a field cannot be read with certainty, return null. DO NOT guess or infer.\n"
-                    "Extract the following exact fields into a valid JSON object:\n"
+                    "You are an administrative document verification assistant reading a passport bio page image.\n"
+                    "Extract the printed text into a valid JSON object matching this schema:\n"
                     "{\n"
                     '  "surname": {"value": string or null, "confidence": float},\n'
                     '  "given_names": {"value": string or null, "confidence": float},\n'
@@ -481,7 +489,10 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                     '  "sex": {"value": "M" or "F" or null, "confidence": float},\n'
                     '  "expiry_date": {"value": string or null, "confidence": float}\n'
                     "}\n"
-                    "Output JSON only."
+                    "Instructions:\n"
+                    "- Transcribe only text clearly legible on this document.\n"
+                    "- If any field is missing or unreadable, return null for value and 0.0 for confidence.\n"
+                    "- Output JSON only."
                 )
                 vlm_bio = await asyncio.to_thread(run_vlm_inference, bio_image, bio_prompt, ml_state, "Passport Bio VLM")
 
@@ -550,7 +561,7 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
             processing_notes.append("Passport bio image missing from job directory.")
 
         # ======================================================================
-        # 2. VISA / OCI EXTRACTION (QWEN2-VL) - ANTI-HALLUCINATION PROMPT
+        # 2. VISA / OCI EXTRACTION (QWEN2-VL)
         # ======================================================================
         doc_paths = refresh_document_paths(job_id)
         visa_path = doc_paths.get("visa_page")
@@ -560,13 +571,8 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
             visa_image = await asyncio.to_thread(load_and_preprocess_image, visa_path)
             if visa_image:
                 visa_prompt = (
-                    "You are a strict, literal OCR engine inspecting an Indian Visa sticker or OCI card document.\n"
-                    "Your objective is to extract ONLY the text that is physically printed on the document.\n\n"
-                    "CRITICAL ANTI-HALLUCINATION INSTRUCTIONS:\n"
-                    "- If an expiry date is NOT printed on the visa, you MUST return null for expiry_date. NEVER guess, assume, or calculate an expiry date from the issue date.\n"
-                    "- For 'place_of_issue', read the exact issuing authority or mission printed on the document. NEVER default to 'NEW DELHI' or any other city unless those exact letters are visible.\n"
-                    "- If any field is faint, obscured, or missing, output null for value and 0.0 for confidence.\n"
-                    "- Extract the following fields into a valid JSON object:\n"
+                    "You are an administrative document verification assistant inspecting an Indian Visa sticker or OCI card document image.\n"
+                    "Extract only the text physically printed on the document into a valid JSON object matching this schema:\n"
                     "{\n"
                     '  "visa_number": {"value": string or null, "confidence": float},\n'
                     '  "visa_type": {"value": string or null, "confidence": float},\n'
@@ -574,7 +580,11 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                     '  "expiry_date": {"value": string or null, "confidence": float},\n'
                     '  "place_of_issue": {"value": string or null, "confidence": float}\n'
                     "}\n"
-                    "Output JSON only."
+                    "Instructions:\n"
+                    "- If an expiry date is not printed on the document, return null for expiry_date. Do not calculate or assume an expiry date based on the issue date.\n"
+                    "- For place_of_issue, transcribe the exact issuing mission or authority printed on the document. If not printed or illegible, return null.\n"
+                    "- If any field is missing or unreadable, return null for value and 0.0 for confidence.\n"
+                    "- Output JSON only."
                 )
                 vlm_visa = await asyncio.to_thread(run_vlm_inference, visa_image, visa_prompt, ml_state, "Visa VLM")
                 fused_record.visa_number = normalize_vlm_field(vlm_visa.get("visa_number"))
@@ -591,7 +601,7 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
             logger.info(f"[{job_id}] Stage 2/4: No visa_page document attached to job. Skipping.")
 
         # ======================================================================
-        # 3. IMMIGRATION ENTRY STAMP EXTRACTION - ANTI-HALLUCINATION PROMPT
+        # 3. IMMIGRATION ENTRY STAMP EXTRACTION (QWEN2-VL)
         # ======================================================================
         doc_paths = refresh_document_paths(job_id)
         stamp_path = doc_paths.get("entry_stamp")
@@ -601,20 +611,17 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
             stamp_image = await asyncio.to_thread(load_and_preprocess_image, stamp_path)
             if stamp_image:
                 stamp_prompt = (
-                    "You are a strict, literal OCR engine inspecting an Indian immigration entry/arrival rubber stamp.\n"
-                    "Your objective is to extract the arrival date and port of entry ONLY if clearly printed on the stamp.\n\n"
-                    "CRITICAL ANTI-HALLUCINATION INSTRUCTIONS:\n"
-                    "- Distinguish strictly between ENTRY/ARRIVAL stamps and EXIT/DEPARTURE stamps. Read only ARRIVAL stamps.\n"
-                    "- For 'arrival_port', transcribe the exact port or airport name printed on the stamp (e.g., 'COCHIN AIRPORT', 'DELHI AIRPORT', 'MUMBAI AIRPORT', etc.).\n"
-                    "- NEVER invent or guess random airports such as 'KANPUR AIRPORT' unless the letters 'KANPUR' are visibly stamped.\n"
-                    "- If the port name is smudged, cut off, unreadable, or illegible, return null for value and 0.0 for confidence.\n"
-                    "- If the arrival date is illegible or not present, return null for value and 0.0 for confidence.\n"
-                    "- Extract the details into a valid JSON object:\n"
+                    "You are an administrative document verification assistant inspecting an Indian immigration entry/arrival rubber stamp image.\n"
+                    "Extract the arrival details into a valid JSON object matching this schema:\n"
                     "{\n"
                     '  "arrival_date": {"value": string or null, "confidence": float},\n'
                     '  "arrival_port": {"value": string or null, "confidence": float}\n'
                     "}\n"
-                    "Output JSON only."
+                    "Instructions:\n"
+                    "- Read only ARRIVAL or ENTRY stamps. Ignore departure or exit stamps.\n"
+                    "- Transcribe the exact port or airport name printed on the arrival stamp. If cut off, smudged, or illegible, return null for value and 0.0 for confidence.\n"
+                    "- If the arrival date is illegible or not present, return null for value and 0.0 for confidence.\n"
+                    "- Output JSON only."
                 )
                 vlm_stamp = await asyncio.to_thread(run_vlm_inference, stamp_image, stamp_prompt, ml_state, "Stamp VLM")
                 fused_record.arrival_date_india = normalize_vlm_field(vlm_stamp.get("arrival_date"))
@@ -628,24 +635,29 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
             logger.info(f"[{job_id}] Stage 3/4: No entry_stamp document attached to job. Skipping.")
 
         # ======================================================================
-        # 4. HANDWRITTEN FORM-C ARRIVAL REPORT - ANTI-HALLUCINATION PROMPT
+        # 4. HANDWRITTEN FORM-C ARRIVAL REPORT (TWO-PASS SECTIONAL EXTRACTION)
         # ======================================================================
         doc_paths = refresh_document_paths(job_id)
         welcome_path = doc_paths.get("welcome_form")
 
         if welcome_path and os.path.exists(welcome_path):
-            logger.info(f"[{job_id}] Stage 4/4: Running Qwen2-VL handwritten Form-C extraction ({welcome_path})...")
-            welcome_image = await asyncio.to_thread(load_and_preprocess_image, welcome_path)
-            if welcome_image:
-                welcome_prompt = (
-                    "You are a strict, literal OCR engine reading a printed ARRIVAL REPORT table (FORM C RULE 14) with handwritten entries.\n"
-                    "Your objective is to transcribe ONLY genuine handwriting filled into the form by the visitor.\n\n"
-                    "CRITICAL ANTI-HALLUCINATION INSTRUCTIONS:\n"
-                    "- Transcribe ONLY the ink handwriting physically written on this page.\n"
-                    "- If a line or box is blank, empty, unwritten, or illegible, return null for value and 0.0 for confidence.\n"
-                    "- ABSOLUTE PROHIBITION: NEVER hallucinate, extrapolate, or invent default dummy data (e.g., DO NOT output 'Thiruvananthapuram', 'john.doe@example.com', 'Business', 'India', or default dates) unless that exact text is physically written in handwriting on this document.\n"
-                    "- If no handwriting is visible on the sheet, ALL fields must return null.\n"
-                    "- Extract into a valid JSON object matching this schema:\n"
+            logger.info(f"[{job_id}] Stage 4/4: Initializing two-pass Form-C extraction ({welcome_path})...")
+            welcome_raw = await asyncio.to_thread(load_and_preprocess_image, welcome_path)
+            
+            if welcome_raw:
+                img_w, img_h = welcome_raw.size
+
+                # ------------------------------------------------------------------
+                # Pass 4A: Top Section (Personal Identity, Residence & Contact Info)
+                # Crop top 58% of the document to include address, email, phone, and visa
+                # ------------------------------------------------------------------
+                top_crop_box = (0, 0, img_w, int(img_h * 0.58))
+                welcome_top_img = welcome_raw.crop(top_crop_box)
+                logger.info(f"[{job_id}] Pass 4A: Cropped top section ({img_w}x{welcome_top_img.size[1]}).")
+
+                welcome_top_prompt = (
+                    "You are an authorized administrative office assistant digitizing the top section of an official Form C (Rule 14) Arrival Report homestay registration card.\n"
+                    "Transcribe the legible handwritten entries on this portion of the card into the corresponding JSON fields:\n"
                     "{\n"
                     '  "name_of_foreigner": {"value": string or null, "confidence": float},\n'
                     '  "full_address": {"value": string or null, "confidence": float},\n'
@@ -655,54 +667,101 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                     '  "telephone_mobile": {"value": string or null, "confidence": float},\n'
                     '  "nationality": {"value": string or null, "confidence": float},\n'
                     '  "place_of_issue_of_visa": {"value": string or null, "confidence": float},\n'
-                    '  "date_of_arrival_in_india": {"value": string or null, "confidence": float},\n'
+                    '  "date_of_arrival_in_india": {"value": "YYYY-MM-DD" or null, "confidence": float}\n'
+                    "}\n"
+                    "Instructions:\n"
+                    "- Transcribe only genuine handwriting or printed text legible on this portion of the card.\n"
+                    "- If a line is blank, unwritten, or illegible, return null for value and 0.0 for confidence.\n"
+                    "- Never guess, extrapolate, or invent details.\n"
+                    "- Output JSON only."
+                )
+
+                # Allocate high-definition visual tokens for crisp handwriting reading
+                vlm_form_top = await asyncio.to_thread(
+                    run_vlm_inference,
+                    welcome_top_img,
+                    welcome_top_prompt,
+                    ml_state,
+                    "Welcome Form (Top Section) VLM",
+                    384,
+                    65536,
+                    262144
+                )
+
+                fused_record.permanent_address = normalize_vlm_field(vlm_form_top.get("full_address"), source="welcome_form")
+                fused_record.city = normalize_vlm_field(vlm_form_top.get("city"), source="welcome_form")
+                fused_record.country = normalize_vlm_field(vlm_form_top.get("country"), source="welcome_form")
+                fused_record.contact_email = normalize_vlm_field(vlm_form_top.get("email"), source="welcome_form")
+                fused_record.contact_phone = normalize_vlm_field(vlm_form_top.get("telephone_mobile"), source="welcome_form")
+
+                # Fallback bio comparisons if passport/visa didn't capture them
+                if not fused_record.visa_place_of_issue.value:
+                    fused_record.visa_place_of_issue = normalize_vlm_field(vlm_form_top.get("place_of_issue_of_visa"), source="welcome_form")
+                if not fused_record.arrival_date_india.value:
+                    fused_record.arrival_date_india = normalize_vlm_field(vlm_form_top.get("date_of_arrival_in_india"), source="welcome_form")
+                if not fused_record.nationality.value:
+                    fused_record.nationality = normalize_vlm_field(vlm_form_top.get("nationality"), source="welcome_form")
+
+                processing_notes.append("Form-C top section (identity & residence) extracted.")
+                fused_record.processing_notes = list(processing_notes)
+                save_intermediate_job_result(job_id, fused_record.model_dump())
+
+                # ------------------------------------------------------------------
+                # Pass 4B: Bottom Section (Homestay Arrival, Travel & Stay Dates)
+                # Crop bottom 55% of the document to include arrival time, duration, purpose, departure
+                # ------------------------------------------------------------------
+                bottom_crop_box = (0, int(img_h * 0.45), img_w, img_h)
+                welcome_bottom_img = welcome_raw.crop(bottom_crop_box)
+                logger.info(f"[{job_id}] Pass 4B: Cropped bottom section ({img_w}x{welcome_bottom_img.size[1]}).")
+
+                welcome_bottom_prompt = (
+                    "You are an authorized administrative office assistant digitizing the bottom section of an official Form C (Rule 14) Arrival Report homestay registration card.\n"
+                    "Transcribe the legible handwritten entries on this portion of the card into the corresponding JSON fields:\n"
+                    "{\n"
                     '  "datetime_arrival_homestay": {"value": string or null, "confidence": float},\n'
                     '  "arrived_from": {"value": string or null, "confidence": float},\n'
                     '  "proceeding_to": {"value": string or null, "confidence": float},\n'
                     '  "proposed_duration_stay_india": {"value": string or null, "confidence": float},\n'
                     '  "purpose_of_visit_profession": {"value": string or null, "confidence": float},\n'
-                    '  "expected_date_departure": {"value": string or null, "confidence": float},\n'
+                    '  "expected_date_departure": {"value": "YYYY-MM-DD" or null, "confidence": float},\n'
                     '  "country_city_arrived_to_india": {"value": string or null, "confidence": float}\n'
                     "}\n"
-                    "Output JSON only."
+                    "Instructions:\n"
+                    "- Transcribe only genuine handwriting or printed text legible on this portion of the card.\n"
+                    "- If a line is blank, unwritten, or illegible, return null for value and 0.0 for confidence.\n"
+                    "- Never guess, extrapolate, or invent details.\n"
+                    "- Output JSON only."
                 )
-                vlm_form = await asyncio.to_thread(
+
+                vlm_form_bottom = await asyncio.to_thread(
                     run_vlm_inference,
-                    welcome_image,
-                    welcome_prompt,
+                    welcome_bottom_img,
+                    welcome_bottom_prompt,
                     ml_state,
-                    "Welcome Form VLM",
-                    512
+                    "Welcome Form (Bottom Section) VLM",
+                    384,
+                    65536,
+                    262144
                 )
 
-                fused_record.permanent_address = normalize_vlm_field(vlm_form.get("full_address"), source="welcome_form")
-                fused_record.city = normalize_vlm_field(vlm_form.get("city"), source="welcome_form")
-                fused_record.country = normalize_vlm_field(vlm_form.get("country"), source="welcome_form")
-                fused_record.contact_email = normalize_vlm_field(vlm_form.get("email"), source="welcome_form")
-                fused_record.contact_phone = normalize_vlm_field(vlm_form.get("telephone_mobile"), source="welcome_form")
-                fused_record.arrival_datetime_homestay = normalize_vlm_field(vlm_form.get("datetime_arrival_homestay"), source="welcome_form")
-                fused_record.arrived_from = normalize_vlm_field(vlm_form.get("arrived_from"), source="welcome_form")
-                fused_record.proceeding_to = normalize_vlm_field(vlm_form.get("proceeding_to"), source="welcome_form")
-                fused_record.stay_duration_india = normalize_vlm_field(vlm_form.get("proposed_duration_stay_india"), source="welcome_form")
-                fused_record.purpose_of_visit = normalize_vlm_field(vlm_form.get("purpose_of_visit_profession"), source="welcome_form")
-                fused_record.expected_departure_date = normalize_vlm_field(vlm_form.get("expected_date_departure"), source="welcome_form")
-                fused_record.arrived_country_city_india = normalize_vlm_field(vlm_form.get("country_city_arrived_to_india"), source="welcome_form")
+                fused_record.arrival_datetime_homestay = normalize_vlm_field(vlm_form_bottom.get("datetime_arrival_homestay"), source="welcome_form")
+                fused_record.arrived_from = normalize_vlm_field(vlm_form_bottom.get("arrived_from"), source="welcome_form")
+                fused_record.proceeding_to = normalize_vlm_field(vlm_form_bottom.get("proceeding_to"), source="welcome_form")
+                fused_record.stay_duration_india = normalize_vlm_field(vlm_form_bottom.get("proposed_duration_stay_india"), source="welcome_form")
+                fused_record.purpose_of_visit = normalize_vlm_field(vlm_form_bottom.get("purpose_of_visit_profession"), source="welcome_form")
+                fused_record.expected_departure_date = normalize_vlm_field(vlm_form_bottom.get("expected_date_departure"), source="welcome_form")
+                fused_record.arrived_country_city_india = normalize_vlm_field(vlm_form_bottom.get("country_city_arrived_to_india"), source="welcome_form")
 
-                if not fused_record.visa_place_of_issue.value:
-                    fused_record.visa_place_of_issue = normalize_vlm_field(vlm_form.get("place_of_issue_of_visa"), source="welcome_form")
-                if not fused_record.arrival_date_india.value:
-                    fused_record.arrival_date_india = normalize_vlm_field(vlm_form.get("date_of_arrival_in_india"), source="welcome_form")
-                if not fused_record.nationality.value:
-                    fused_record.nationality = normalize_vlm_field(vlm_form.get("nationality"), source="welcome_form")
-
-                processing_notes.append("Handwritten Form-C arrival report extracted via Qwen2-VL.")
+                processing_notes.append("Form-C bottom section (homestay & travel dates) extracted.")
         else:
             logger.info(f"[{job_id}] Stage 4/4: No welcome_form document attached to job. Skipping.")
 
+        # Persist final fused record with diagnostic tournament logs and total elapsed duration
         total_job_duration = time.perf_counter() - job_start_time
         processing_notes.append(f"Complete pipeline executed in {total_job_duration:.2f}s.")
         fused_record.processing_notes = processing_notes
 
+        # Transition status to COMPLETED and commit final result
         save_job_result(job_id, fused_record.model_dump())
         logger.info(f"[+] Job {job_id} successfully completed in {total_job_duration:.2f}s.")
 
