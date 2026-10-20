@@ -8,10 +8,10 @@
 #
 # Anti-Hallucination & Legibility Architecture:
 # - Neutral administrative archival prompts: Prevents PII safety refusal triggers.
-# - Strict literal transcription: Explicitly forbids inferring, calculating, or inventing dates/places.
-# - Two-pass sectional reading for Form-C: Splits the sheet into Top (personal/contact) and
-#   Bottom (stay/travel) sections, halving the visual attention area and doubling pixel legibility.
-# - High-definition visual patch allocation for handwriting without exceeding CPU memory bounds.
+# - Dynamic visual token bounding: Properly respects min_pixels_override and max_pixels_override.
+# - High-definition visual patch allocation for fine cursive handwriting.
+# - OCR-Assisted Grounding: Supplies raw Tesseract text tokens as context hints to Qwen2-VL,
+#   allowing the model to decipher cursive ink without hallucinating.
 # ==============================================================================
 
 import asyncio
@@ -23,7 +23,8 @@ import re
 import time
 from typing import Dict, Any, Optional, List
 
-from PIL import Image
+from PIL import Image, ImageOps
+import pytesseract
 import torch
 from passporteye import read_mrz
 
@@ -91,8 +92,9 @@ def load_and_preprocess_image(
     max_dimension: Optional[int] = None
 ) -> Optional[Image.Image]:
     """
-    Loads an image from disk storage, standardizes color channels to RGB,
-    and scales proportionally if the maximum dimension exceeds configured limits.
+    Loads an image from disk storage, applies EXIF orientation transpositions,
+    standardizes color channels to RGB, and scales proportionally if the maximum
+    dimension exceeds configured limits.
 
     :param file_path: Absolute or relative filesystem path to the image file.
     :param max_dimension: Maximum allowed width or height in pixels. Defaults to settings.max_image_dimension.
@@ -102,15 +104,18 @@ def load_and_preprocess_image(
         logger.warning(f"[ImageLoader] File not found on disk: {file_path}")
         return None
 
-    # Resolve target dimension from settings if not explicitly provided
     target_max_dim = max_dimension if max_dimension is not None else settings.max_image_dimension
 
     try:
         start_t = time.perf_counter()
-        image = Image.open(file_path)
+        raw_img = Image.open(file_path)
+
+        # Standardize orientation using EXIF tags
+        image = ImageOps.exif_transpose(raw_img)
+
         orig_w, orig_h = image.size
 
-        # Standardize color profile to 3-channel RGB (removes alpha or CMYK artifacts)
+        # Standardize color profile to 3-channel RGB
         if image.mode != "RGB":
             image = image.convert("RGB")
 
@@ -171,7 +176,7 @@ def run_vlm_inference(
     # Explicitly pin PyTorch compute threads to physical CPU cores
     torch.set_num_threads(settings.torch_cpu_threads)
 
-    # Determine visual patch boundaries
+    # Resolve visual patch boundaries dynamically
     effective_min_pixels = min_pixels_override if min_pixels_override is not None else settings.min_pixels
     effective_max_pixels = max_pixels_override if max_pixels_override is not None else settings.max_pixels
 
@@ -383,8 +388,8 @@ def refresh_document_paths(job_id: str) -> Dict[str, str]:
 async def process_single_job(job_id: str, ml_state: dict) -> None:
     """
     Executes the multi-document extraction pipeline for a single queued job.
-    Uses neutral administrative framing and two-pass sectional extraction on Form-C
-    to prevent safety refusals and maximize legibility.
+    Uses neutral administrative framing, high-definition visual patches, and
+    OCR-assisted hints on Form-C to decipher cursive handwriting.
 
     :param job_id: Unique UUID string identifier of the target job.
     :param ml_state: Shared dictionary holding model handles.
@@ -635,16 +640,27 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
             logger.info(f"[{job_id}] Stage 3/4: No entry_stamp document attached to job. Skipping.")
 
         # ======================================================================
-        # 4. HANDWRITTEN FORM-C ARRIVAL REPORT (TWO-PASS SECTIONAL EXTRACTION)
+        # 4. HANDWRITTEN FORM-C ARRIVAL REPORT (OCR-GROUNDED TWO-PASS EXTRACTION)
         # ======================================================================
         doc_paths = refresh_document_paths(job_id)
         welcome_path = doc_paths.get("welcome_form")
 
         if welcome_path and os.path.exists(welcome_path):
-            logger.info(f"[{job_id}] Stage 4/4: Initializing two-pass Form-C extraction ({welcome_path})...")
+            logger.info(f"[{job_id}] Stage 4/4: Initializing OCR-grounded Form-C extraction ({welcome_path})...")
             welcome_raw = await asyncio.to_thread(load_and_preprocess_image, welcome_path)
             
             if welcome_raw:
+                # Run rapid local Tesseract OCR to obtain raw candidate lines as ground truth cues
+                ocr_start = time.perf_counter()
+                try:
+                    raw_ocr_text = await asyncio.to_thread(pytesseract.image_to_string, welcome_raw)
+                    ocr_lines = [line.strip() for line in raw_ocr_text.splitlines() if line.strip()]
+                    ocr_summary = "\n".join(ocr_lines[:20])
+                    logger.info(f"[{job_id}] Fast OCR character scan finished in {(time.perf_counter() - ocr_start):.2f}s ({len(ocr_lines)} lines).")
+                except Exception as ocr_e:
+                    logger.warning(f"[{job_id}] Fast OCR scan skipped: {ocr_e}")
+                    ocr_summary = "No OCR hints available."
+
                 img_w, img_h = welcome_raw.size
 
                 # ------------------------------------------------------------------
@@ -656,8 +672,10 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                 logger.info(f"[{job_id}] Pass 4A: Cropped top section ({img_w}x{welcome_top_img.size[1]}).")
 
                 welcome_top_prompt = (
-                    "You are an authorized administrative office assistant digitizing the top section of an official Form C (Rule 14) Arrival Report homestay registration card.\n"
-                    "Transcribe the legible handwritten entries on this portion of the card into the corresponding JSON fields:\n"
+                    "You are an administrative office assistant digitizing the top section of an official Form C (Rule 14) Arrival Report homestay registration card.\n"
+                    "Here are raw OCR character tokens detected on this form to assist your reading:\n"
+                    f"\"\"\"\n{ocr_summary}\n\"\"\"\n\n"
+                    "Using both the visual image and the OCR tokens as reference, transcribe the handwritten entries into this JSON schema:\n"
                     "{\n"
                     '  "name_of_foreigner": {"value": string or null, "confidence": float},\n'
                     '  "full_address": {"value": string or null, "confidence": float},\n'
@@ -670,9 +688,9 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                     '  "date_of_arrival_in_india": {"value": "YYYY-MM-DD" or null, "confidence": float}\n'
                     "}\n"
                     "Instructions:\n"
-                    "- Transcribe only genuine handwriting or printed text legible on this portion of the card.\n"
-                    "- If a line is blank, unwritten, or illegible, return null for value and 0.0 for confidence.\n"
-                    "- Never guess, extrapolate, or invent details.\n"
+                    "- Transcribe the genuine handwriting written on this card.\n"
+                    "- If a line is blank or empty, return null for value and 0.0 for confidence.\n"
+                    "- Never invent or hallucinate dummy data.\n"
                     "- Output JSON only."
                 )
 
@@ -715,21 +733,23 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                 logger.info(f"[{job_id}] Pass 4B: Cropped bottom section ({img_w}x{welcome_bottom_img.size[1]}).")
 
                 welcome_bottom_prompt = (
-                    "You are an authorized administrative office assistant digitizing the bottom section of an official Form C (Rule 14) Arrival Report homestay registration card.\n"
-                    "Transcribe the legible handwritten entries on this portion of the card into the corresponding JSON fields:\n"
+                    "You are an administrative office assistant digitizing the bottom section of an official Form C (Rule 14) Arrival Report homestay registration card.\n"
+                    "Here are raw OCR character tokens detected on this form to assist your reading:\n"
+                    f"\"\"\"\n{ocr_summary}\n\"\"\"\n\n"
+                    "Using both the visual image and the OCR tokens as reference, transcribe the handwritten entries into this JSON schema:\n"
                     "{\n"
                     '  "datetime_arrival_homestay": {"value": string or null, "confidence": float},\n'
                     '  "arrived_from": {"value": string or null, "confidence": float},\n'
                     '  "proceeding_to": {"value": string or null, "confidence": float},\n'
-                    '  "proposed_duration_stay_india": {"value": string or null, "confidence": float},\n'
+                    '  "stay_duration_india": {"value": string or null, "confidence": float},\n'
                     '  "purpose_of_visit_profession": {"value": string or null, "confidence": float},\n'
                     '  "expected_date_departure": {"value": "YYYY-MM-DD" or null, "confidence": float},\n'
                     '  "country_city_arrived_to_india": {"value": string or null, "confidence": float}\n'
                     "}\n"
                     "Instructions:\n"
-                    "- Transcribe only genuine handwriting or printed text legible on this portion of the card.\n"
-                    "- If a line is blank, unwritten, or illegible, return null for value and 0.0 for confidence.\n"
-                    "- Never guess, extrapolate, or invent details.\n"
+                    "- Transcribe the genuine handwriting written on this card.\n"
+                    "- If a line is blank or empty, return null for value and 0.0 for confidence.\n"
+                    "- Never invent or hallucinate dummy data.\n"
                     "- Output JSON only."
                 )
 
