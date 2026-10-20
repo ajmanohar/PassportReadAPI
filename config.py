@@ -1,11 +1,15 @@
-"""
-Central configuration settings for the PassportReadAPI service.
-Loads runtime parameters from environment variables with sensible production defaults.
-Configured specifically for low-latency multithreaded CPU inference on Intel edge hardware.
-"""
+# ==============================================================================
+# config.py - PassportReadAPI
+# ==============================================================================
+# Central configuration settings for the PassportReadAPI service.
+# Loads runtime parameters and security credentials from environment variables 
+# or local .env file with sensible production defaults.
+# Configured specifically for low-latency multithreaded CPU inference on Intel edge hardware.
+# ==============================================================================
 
 import os
 import shutil
+from typing import Optional
 from pydantic_settings import BaseSettings
 from pydantic import Field
 
@@ -13,7 +17,7 @@ from pydantic import Field
 class Settings(BaseSettings):
     """
     Application settings model defining machine learning runtime thresholds,
-    API metadata, hardware execution configurations, and OCR binary paths.
+    API metadata, hardware execution configurations, security credentials, and OCR binary paths.
     """
     # -------------------------------------------------------------------------
     # API Application Metadata
@@ -32,6 +36,16 @@ class Settings(BaseSettings):
             "Tesseract MRZ check-digit parsing, and asynchronous batch processing."
         ),
         description="Extended documentation narrative"
+    )
+
+    # -------------------------------------------------------------------------
+    # Security & API Authentication (Pre-Shared Bearer Token)
+    # -------------------------------------------------------------------------
+    # High-entropy pre-shared secret token for securing endpoints over the public internet.
+    # Set via API_BEARER_TOKEN in .env. If left None or empty, auth validation is bypassed.
+    api_bearer_token: Optional[str] = Field(
+        default=None,
+        description="Pre-shared static Bearer token used to authenticate incoming API requests"
     )
 
     # -------------------------------------------------------------------------
@@ -101,7 +115,7 @@ class Settings(BaseSettings):
     )
 
     class Config:
-        # Load environment variables matching case-insensitively
+        # Load environment variables matching case-insensitively from .env
         env_file = ".env"
         env_file_encoding = "utf-8"
         extra = "ignore"
