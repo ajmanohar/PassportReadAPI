@@ -6,12 +6,13 @@
 # Executes an unconditional 'best-of-both' confidence tournament between Tesseract MRZ and
 # Qwen2-VL for the Passport Bio page, selecting the highest-confidence extraction per field.
 #
-# Anti-Hallucination & Legibility Architecture:
-# - Neutral administrative archival prompts: Prevents PII safety refusal triggers.
-# - Dynamic visual token bounding: Properly respects min_pixels_override and max_pixels_override.
+# Server-Side Document Normalization:
+# - Applies EXIF transposition to correct camera orientation tags.
+# - Automatically detects rotated/landscape documents using Tesseract OSD and rotates them upright.
+# - Neutral administrative archival prompts preventing safety refusal triggers.
+# - Dynamic visual token bounding respecting per-stage patch ceilings.
 # - High-definition visual patch allocation for fine cursive handwriting.
-# - OCR-Assisted Grounding: Supplies raw Tesseract text tokens as context hints to Qwen2-VL,
-#   allowing the model to decipher cursive ink without hallucinating.
+# - OCR-Assisted Grounding: Supplies raw Tesseract text tokens as context hints to Qwen2-VL.
 # ==============================================================================
 
 import asyncio
@@ -84,42 +85,64 @@ def sanitize_extracted_string(val: Optional[str]) -> Optional[str]:
 
 
 # ==============================================================================
-# Image Preparation Helper
+# Image Preparation Helper with Automated Orientation Normalization
 # ==============================================================================
 
 def load_and_preprocess_image(
     file_path: str,
-    max_dimension: Optional[int] = None
+    max_dimension: Optional[int] = None,
+    enable_auto_orient: bool = True
 ) -> Optional[Image.Image]:
     """
     Loads an image from disk storage, applies EXIF orientation transpositions,
-    standardizes color channels to RGB, and scales proportionally if the maximum
-    dimension exceeds configured limits.
+    standardizes color channels to RGB, checks for orientation misalignments,
+    and scales proportionally if the maximum dimension exceeds configured limits.
 
     :param file_path: Absolute or relative filesystem path to the image file.
     :param max_dimension: Maximum allowed width or height in pixels. Defaults to settings.max_image_dimension.
+    :param enable_auto_orient: When True, uses Tesseract OSD to upright images stripped of EXIF tags.
     :return: Prepared PIL Image instance, or None if the file cannot be read.
     """
     if not os.path.exists(file_path):
         logger.warning(f"[ImageLoader] File not found on disk: {file_path}")
         return None
 
+    # Resolve default pixel ceiling from application settings
     target_max_dim = max_dimension if max_dimension is not None else settings.max_image_dimension
 
     try:
         start_t = time.perf_counter()
         raw_img = Image.open(file_path)
 
-        # Standardize orientation using EXIF tags
+        # 1. Standardize orientation using EXIF orientation tags (if present)
         image = ImageOps.exif_transpose(raw_img)
 
-        orig_w, orig_h = image.size
-
-        # Standardize color profile to 3-channel RGB
+        # 2. Standardize color profile to 3-channel RGB (eliminates alpha channel or CMYK artifacts)
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        # Downscale proportionally if larger than configured ceiling
+        # 3. Server-side auto-orientation check for documents stripped of EXIF metadata
+        # If the image was uploaded landscape or inverted, Tesseract OSD detects the required rotation
+        if enable_auto_orient:
+            try:
+                # Downsample a quick thumbnail for ultra-fast OSD check to avoid blocking
+                thumb = image.copy()
+                thumb.thumbnail((800, 800), Image.Resampling.LANCZOS)
+                osd_data = pytesseract.image_to_osd(thumb, output_type=pytesseract.Output.DICT)
+                rotate_angle = osd_data.get("rotate", 0)
+
+                # Rotate image if Tesseract detects 90, 180, or 270 degree rotation with confidence
+                if rotate_angle in [90, 180, 270]:
+                    logger.info(f"[ImageLoader] Tesseract OSD detected {rotate_angle}° rotation. Correcting '{os.path.basename(file_path)}'...")
+                    # PIL rotate is counter-clockwise; rotating by 360 - rotate_angle corrects it
+                    image = image.rotate(360 - rotate_angle, expand=True)
+            except Exception as osd_err:
+                # OSD might fail on documents with low text density; proceed gracefully without failing
+                logger.debug(f"[ImageLoader] OSD orientation detection bypassed: {osd_err}")
+
+        orig_w, orig_h = image.size
+
+        # 4. Downscale proportionally if larger than configured ceiling
         if max(orig_w, orig_h) > target_max_dim:
             image.thumbnail((target_max_dim, target_max_dim), Image.Resampling.LANCZOS)
             new_w, new_h = image.size
@@ -655,7 +678,7 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                 try:
                     raw_ocr_text = await asyncio.to_thread(pytesseract.image_to_string, welcome_raw)
                     ocr_lines = [line.strip() for line in raw_ocr_text.splitlines() if line.strip()]
-                    ocr_summary = "\n".join(ocr_lines[:20])
+                    ocr_summary = "\n".join(ocr_lines[:25])
                     logger.info(f"[{job_id}] Fast OCR character scan finished in {(time.perf_counter() - ocr_start):.2f}s ({len(ocr_lines)} lines).")
                 except Exception as ocr_e:
                     logger.warning(f"[{job_id}] Fast OCR scan skipped: {ocr_e}")
@@ -712,6 +735,14 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                 fused_record.contact_email = normalize_vlm_field(vlm_form_top.get("email"), source="welcome_form")
                 fused_record.contact_phone = normalize_vlm_field(vlm_form_top.get("telephone_mobile"), source="welcome_form")
 
+                # Fallback guest name from Form-C if bio scan didn't capture surname or given names
+                form_c_name = normalize_vlm_field(vlm_form_top.get("name_of_foreigner"), source="welcome_form")
+                if form_c_name.value and (not fused_record.given_names.value and not fused_record.surname.value):
+                    parts = form_c_name.value.split(maxsplit=1)
+                    fused_record.surname = FieldResult(value=parts[0], confidence=form_c_name.confidence, source="welcome_form")
+                    if len(parts) > 1:
+                        fused_record.given_names = FieldResult(value=parts[1], confidence=form_c_name.confidence, source="welcome_form")
+
                 # Fallback bio comparisons if passport/visa didn't capture them
                 if not fused_record.visa_place_of_issue.value:
                     fused_record.visa_place_of_issue = normalize_vlm_field(vlm_form_top.get("place_of_issue_of_visa"), source="welcome_form")
@@ -741,7 +772,7 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                     '  "datetime_arrival_homestay": {"value": string or null, "confidence": float},\n'
                     '  "arrived_from": {"value": string or null, "confidence": float},\n'
                     '  "proceeding_to": {"value": string or null, "confidence": float},\n'
-                    '  "stay_duration_india": {"value": string or null, "confidence": float},\n'
+                    '  "proposed_duration_stay_india": {"value": string or null, "confidence": float},\n'
                     '  "purpose_of_visit_profession": {"value": string or null, "confidence": float},\n'
                     '  "expected_date_departure": {"value": "YYYY-MM-DD" or null, "confidence": float},\n'
                     '  "country_city_arrived_to_india": {"value": string or null, "confidence": float}\n'
@@ -767,7 +798,11 @@ async def process_single_job(job_id: str, ml_state: dict) -> None:
                 fused_record.arrival_datetime_homestay = normalize_vlm_field(vlm_form_bottom.get("datetime_arrival_homestay"), source="welcome_form")
                 fused_record.arrived_from = normalize_vlm_field(vlm_form_bottom.get("arrived_from"), source="welcome_form")
                 fused_record.proceeding_to = normalize_vlm_field(vlm_form_bottom.get("proceeding_to"), source="welcome_form")
-                fused_record.stay_duration_india = normalize_vlm_field(vlm_form_bottom.get("proposed_duration_stay_india"), source="welcome_form")
+                # Bind proposed_duration_stay_india with fallback check for stay_duration_india
+                fused_record.stay_duration_india = normalize_vlm_field(
+                    vlm_form_bottom.get("proposed_duration_stay_india") or vlm_form_bottom.get("stay_duration_india"),
+                    source="welcome_form"
+                )
                 fused_record.purpose_of_visit = normalize_vlm_field(vlm_form_bottom.get("purpose_of_visit_profession"), source="welcome_form")
                 fused_record.expected_departure_date = normalize_vlm_field(vlm_form_bottom.get("expected_date_departure"), source="welcome_form")
                 fused_record.arrived_country_city_india = normalize_vlm_field(vlm_form_bottom.get("country_city_arrived_to_india"), source="welcome_form")
