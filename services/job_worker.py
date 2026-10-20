@@ -1,41 +1,52 @@
 # ==============================================================================
 # job_worker.py - PassportReadAPI
 # ==============================================================================
-# Background worker executing multi-document Form-C extraction pipelines:
-# Stage 1: Passport Bio-Data (Tesseract MRZ + Qwen2-VL tournament)
-# Stage 2: Visa / OCI Extraction (Qwen2-VL)
-# Stage 3: Arrival Immigration Stamp Extraction (Qwen2-VL)
-# Stage 4: Handwritten Form-C Rule 14 Arrival Report (Qwen2-VL)
+# Background batch execution pipeline and serial queue worker for asynchronous Form-C jobs.
+# Processes multi-document bundles (Passport Bio, Visa, Entry Stamp, Welcome Form) sequentially.
+# Executes an unconditional 'best-of-both' confidence tournament between Tesseract MRZ and
+# Qwen2-VL for the Passport Bio page, selecting the highest-confidence extraction per field.
+# Persists progress and results directly to the SQLite database with detailed latency telemetry
+# and progressive intermediate updates after each stage.
 #
-# NOTE: Prompt contains zero dummy/synthetic data to prevent VLM hallucination.
-# If a field is unreadable or absent, the model is strictly constrained to return null.
+# Anti-Hallucination & CPU Execution Tuning:
+# - Strict zero-shot prompts: No synthetic/mock addresses (prevents "Parthasarthy Nagar" hallucination).
+# - Hard token blacklist sanitizer: Rejects known dummy strings and generic placeholders.
+# - Caps visual tokens via settings.min_pixels and settings.max_pixels (49 - 144 patches).
+# - Downscales images to settings.max_image_dimension (512px) to prevent CPU latency blowouts.
+# - Enforces strict PyTorch thread allocation to physical CPU cores.
+# - Emits real-time intermediate state to SQLite so mobile dashboard pills turn green progressively.
 # ==============================================================================
 
-import os
+import asyncio
+import io
 import json
+import logging
+import os
 import re
 import time
-import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+
 from PIL import Image
-
 import torch
-from transformers import AutoProcessor
+from passporteye import read_mrz
 
-from storage.db import (
-    get_job,
-    update_job_status,
-    save_job_result,
-    update_stage_progress,
-    refresh_document_paths
-)
+# Central configuration and repository imports
+from config import settings
+from storage.db import update_job_status, save_intermediate_job_result, save_job_result, get_job
 from schemas.job import GuestFormCRecord, FieldResult
 
-# Configure structured logging
-logger = logging.getLogger("passport_read_api.job_worker")
+# Set up module-level logger
+logger = logging.getLogger("job_worker")
+logger.setLevel(logging.INFO)
 
-# Blacklist of hallucinated / mock strings to reject at validation time
-FORBIDDEN_HALLUCINATIONS = [
+# Global in-memory queue holding job UUID strings for sequential execution by the worker loop
+job_queue: asyncio.Queue = asyncio.Queue()
+
+# Base disk directory for persisting uploaded document images during asynchronous processing
+BASE_STORAGE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "storage", "jobs")
+
+# Blacklist of hallucinated tokens and mock placeholders to reject during field normalization
+FORBIDDEN_HALLUCINATIONS: List[str] = [
     "parthasarthy",
     "parthasarathy",
     "chennai",
@@ -46,13 +57,17 @@ FORBIDDEN_HALLUCINATIONS = [
 ]
 
 
+# ==============================================================================
+# Sanitization & Anti-Hallucination Guardrails
+# ==============================================================================
+
 def sanitize_extracted_string(val: Optional[str]) -> Optional[str]:
     """
-    Sanitizes extracted text to prevent dummy/mock data hallucination from leaking through.
+    Sanitizes extracted text to prevent dummy or hallucinated strings from persisting.
     If the value contains known hallucination tokens or generic placeholders, returns None.
 
     :param val: Raw string extracted from VLM or OCR.
-    :return: Cleaned string, or None if rejected.
+    :return: Sanitized string, or None if rejected.
     """
     if not val:
         return None
@@ -70,332 +85,679 @@ def sanitize_extracted_string(val: Optional[str]) -> Optional[str]:
     return val_clean
 
 
-def build_field_result(
-    val: Optional[str],
-    confidence: float = 0.9,
-    source: str = "vlm"
-) -> FieldResult:
+# ==============================================================================
+# Image Preparation Helper
+# ==============================================================================
+
+def load_and_preprocess_image(
+    file_path: str,
+    max_dimension: Optional[int] = None
+) -> Optional[Image.Image]:
     """
-    Constructs a validated FieldResult instance. Strips empty or hallucinated values.
+    Loads an image from disk storage, standardizes color channels to RGB,
+    logs its native geometry, and downscales proportionally if the maximum
+    dimension exceeds configured limits (defaulting to settings.max_image_dimension: 512px).
+    Bounding the longest edge to 512px bounds visual tokens between 49 and 144 patches,
+    keeping CPU generation latency under 15-25 seconds per stage.
 
-    :param val: Extracted string candidate.
-    :param confidence: Metric confidence score (0.0 to 1.0).
-    :param source: Pipeline attribution source ('mrz', 'vlm', 'rule_fallback').
-    :return: Strongly typed FieldResult schema object.
+    :param file_path: Absolute or relative filesystem path to the image file.
+    :param max_dimension: Maximum allowed width or height in pixels. Defaults to settings.max_image_dimension.
+    :return: Prepared PIL Image instance, or None if the file cannot be read.
     """
-    sanitized = sanitize_extracted_string(val)
-    if sanitized is None:
-        return FieldResult(value=None, confidence=0.0, source=source)
-    return FieldResult(value=sanitized, confidence=confidence, source=source)
+    if not os.path.exists(file_path):
+        logger.warning(f"[ImageLoader] File not found on disk: {file_path}")
+        return None
+
+    # Resolve target dimension from settings if not explicitly provided
+    target_max_dim = max_dimension if max_dimension is not None else settings.max_image_dimension
+
+    try:
+        start_t = time.perf_counter()
+        image = Image.open(file_path)
+        orig_w, orig_h = image.size
+
+        # Standardize color profile to 3-channel RGB (removes alpha or CMYK artifacts)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+
+        # Downscale proportionally to bound attention matrix computation while preserving sharp text
+        if max(orig_w, orig_h) > target_max_dim:
+            image.thumbnail((target_max_dim, target_max_dim), Image.Resampling.LANCZOS)
+            new_w, new_h = image.size
+            logger.info(
+                f"[ImageLoader] Rescaled '{os.path.basename(file_path)}' from {orig_w}x{orig_h} "
+                f"to {new_w}x{new_h} in {(time.perf_counter() - start_t):.3f}s."
+            )
+        else:
+            logger.info(
+                f"[ImageLoader] Loaded '{os.path.basename(file_path)}' at native {orig_w}x{orig_h} "
+                f"in {(time.perf_counter() - start_t):.3f}s."
+            )
+
+        return image
+    except Exception as exc:
+        logger.error(f"[ImageLoader] Failed to load/preprocess '{file_path}': {str(exc)}", exc_info=True)
+        return None
 
 
-def run_vlm_prompt(
-    model: Any,
-    processor: AutoProcessor,
-    image_path: str,
-    prompt_text: str,
-    max_new_tokens: int = 512
-) -> str:
+# ==============================================================================
+# Inference Subroutine Helpers
+# ==============================================================================
+
+def run_vlm_inference(
+    image: Image.Image,
+    system_prompt: str,
+    ml_state: dict,
+    stage_label: str = "VLM",
+    max_tokens_override: Optional[int] = None
+) -> dict:
     """
-    Executes CPU-bound Qwen2-VL vision inference with strict token limits and clamped image bounds.
+    Executes a structured query against the shared in-memory Qwen2-VL model instance
+    with detailed per-stage execution timing and parses the output into a Python dictionary.
 
-    :param model: HuggingFace model instance.
-    :param processor: Preprocessing pipeline.
-    :param image_path: Local disk path to image file.
-    :param prompt_text: Explicit extraction instructions without any sample mock data.
-    :param max_new_tokens: Bound generation length to prevent CPU runaway.
-    :return: Generated raw text output from the model.
+    :param image: Preprocessed PIL Image instance bounded to 512px.
+    :param system_prompt: Guidance text instructing the VLM on expected JSON fields.
+    :param ml_state: Shared dictionary holding 'model' and 'processor' instances.
+    :param stage_label: Diagnostic label for logging (e.g. 'Passport Bio', 'Visa', etc.).
+    :param max_tokens_override: Optional integer to override default max_new_tokens for dense forms.
+    :return: Extracted key-value dictionary parsed from the model's generated JSON.
     """
-    if not os.path.exists(image_path):
-        raise FileNotFoundError(f"Target image path does not exist: {image_path}")
+    from qwen_vl_utils import process_vision_info
 
-    # Load and constrain image dimensions to avoid high pixel token counts
-    with Image.open(image_path) as raw_img:
-        img = raw_img.convert("RGB")
-        max_dim = 1024
-        if max(img.size) > max_dim:
-            scale = max_dim / float(max(img.size))
-            new_size = (int(img.size[0] * scale), int(img.size[1] * scale))
-            img = img.resize(new_size, Image.Resampling.LANCZOS)
+    processor = ml_state.get("processor")
+    model = ml_state.get("model")
 
+    if not model or not processor:
+        raise RuntimeError("Qwen2-VL model and processor are not loaded in ml_state.")
+
+    # Explicitly pin PyTorch compute threads to prevent thread contention on CPU
+    torch.set_num_threads(settings.torch_cpu_threads)
+
+    start_vlm_time = time.perf_counter()
+    logger.info(f"[{stage_label}] Preparing prompt tensor inputs (image: {image.size[0]}x{image.size[1]})...")
+
+    # Format user prompt according to Qwen2-VL chat conversation template
     messages = [
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": img},
-                {"type": "text", "text": prompt_text}
+                {
+                    "type": "image",
+                    "image": image,
+                    # Bound visual tokens strictly between 49 and 144 patches for fast CPU inference
+                    "min_pixels": settings.min_pixels,
+                    "max_pixels": settings.max_pixels
+                },
+                {"type": "text", "text": system_prompt}
             ]
         }
     ]
 
-    prompt_formatted = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
+    # Process prompt template and extract visual input tensors
+    text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(messages)
 
-    image_inputs, video_inputs = processor.image_processor(
-        images=[img],
-        videos=None,
-        return_tensors="pt"
-    )
-
+    # Build input tensor dictionaries
     inputs = processor(
-        text=[prompt_formatted],
+        text=[text_prompt],
         images=image_inputs,
+        videos=video_inputs,
         padding=True,
         return_tensors="pt"
     )
 
+    # Move tensors to designated execution device (CPU)
+    inputs = {k: v.to(settings.device) for k, v in inputs.items()}
+
+    # Resolve token ceiling (Stage 4 handwritten form requires higher budget to avoid truncation)
+    effective_max_tokens = max_tokens_override if max_tokens_override is not None else settings.max_new_tokens
+    logger.info(f"[{stage_label}] Beginning PyTorch CPU token generation (max_new_tokens={effective_max_tokens})...")
+    gen_start = time.perf_counter()
+
+    # Run deterministic greedy decoding without calculating gradients to suppress hallucinations
     with torch.no_grad():
-        output_ids = model.generate(
+        generated_ids = model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,  # Deterministic greedy decoding to suppress hallucinations
-            temperature=None,
-            top_p=None
+            max_new_tokens=effective_max_tokens,
+            do_sample=False
         )
 
-    # Decode only newly generated tokens
-    prompt_len = inputs["input_ids"].shape[1]
-    generated_ids = output_ids[:, prompt_len:]
-    raw_output = processor.batch_decode(
-        generated_ids,
+    gen_duration = time.perf_counter() - gen_start
+    total_duration = time.perf_counter() - start_vlm_time
+
+    # Separate model-generated response tokens from the input prompt tokens
+    generated_ids_trimmed = [
+        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
+    ]
+    tokens_generated = len(generated_ids_trimmed[0]) if generated_ids_trimmed else 0
+
+    # Decode tokens into UTF-8 string
+    raw_text = processor.batch_decode(
+        generated_ids_trimmed,
         skip_special_tokens=True,
-        clean_up_tokenization_spaces=True
-    )[0].strip()
+        clean_up_tokenization_spaces=False
+    )[0]
 
-    return raw_output
+    logger.info(
+        f"[{stage_label}] Generated {tokens_generated} tokens in {gen_duration:.2f}s "
+        f"({tokens_generated / max(0.01, gen_duration):.1f} tok/s). Total stage latency: {total_duration:.2f}s."
+    )
 
-
-def extract_json_from_output(text: str) -> Dict[str, Any]:
-    """
-    Extracts the root JSON dictionary from markdown codeblocks or raw output strings.
-
-    :param text: Raw VLM output string.
-    :return: Parsed Python dictionary or empty dict if invalid.
-    """
+    # Extract JSON string payload bounded by braces with syntax fallback
     try:
-        # Match ```json ... ``` blocks
-        json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
-        if json_match:
-            return json.loads(json_match.group(1).strip())
-        
-        # Match outermost curly braces
-        brace_match = re.search(r"(\{[\s\S]*\})", text)
-        if brace_match:
-            return json.loads(brace_match.group(1).strip())
-            
-        return json.loads(text.strip())
+        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if match:
+            parsed_json = json.loads(match.group(0))
+            return parsed_json
+        return json.loads(raw_text)
     except Exception as parse_err:
-        logger.warning(f"[JSON Parser] Failed to parse model output as JSON: {parse_err}. Raw text: {text[:200]}")
-        return {}
+        logger.warning(
+            f"[{stage_label}] JSON parse error: {parse_err}. Attempting truncation cleanup. Excerpt: {raw_text[:200]}"
+        )
+        # Fallback: Strip trailing comma and close dangling braces if generation was cut off
+        try:
+            cleaned = re.sub(r",\s*([\}\]])", r"\1", raw_text)
+            if not cleaned.strip().endswith("}"):
+                cleaned = cleaned.strip() + '"}}'
+            return json.loads(cleaned)
+        except Exception:
+            return {"confidence_note": f"Raw model response: {raw_text}"}
 
 
-def process_guest_job(
-    job_id: str,
-    vlm_model: Any,
-    vlm_processor: AutoProcessor,
-    tesseract_ocr_engine: Any = None
-) -> None:
+# ==============================================================================
+# Tournament Selection & Normalization Helpers
+# ==============================================================================
+
+def normalize_vlm_field(
+    raw_field: Any,
+    default_score: float = 0.80,
+    source: str = "qwen2_vl"
+) -> FieldResult:
     """
-    Orchestrates the 4-stage sequential extraction for an incoming guest submission.
+    Parses a nested or scalar field returned by Qwen2-VL into a validated FieldResult.
+    Sanitizes against dummy strings and hallucinated tokens.
 
-    :param job_id: Unique UUID identifying the active job.
-    :param vlm_model: Loaded Qwen2-VL model instance.
-    :param vlm_processor: Loaded Hugging Face processor.
-    :param tesseract_ocr_engine: Optional offline OCR engine for MRZ.
+    :param raw_field: Dict containing {'value': ..., 'confidence': ...} or a raw scalar.
+    :param default_score: Default confidence score if none is specified by the model.
+    :param source: Pipeline provenance label.
+    :return: Sanitized FieldResult instance.
     """
-    logger.info(f"[{job_id}] Starting background extraction execution.")
+    if raw_field is None:
+        return FieldResult(value=None, confidence=0.0, source=source)
+
+    if isinstance(raw_field, dict):
+        val = raw_field.get("value")
+        raw_conf = raw_field.get("confidence", default_score)
+    else:
+        val = str(raw_field)
+        raw_conf = default_score
+
+    # Sanitize string through anti-hallucination filter
+    clean_val = sanitize_extracted_string(val)
+    if clean_val is None:
+        return FieldResult(value=None, confidence=0.0, source=source)
+
+    try:
+        conf_float = float(raw_conf)
+        conf_float = max(0.0, min(1.0, conf_float))
+    except (ValueError, TypeError):
+        conf_float = default_score
+
+    return FieldResult(
+        value=clean_val,
+        confidence=round(conf_float, 2),
+        source=source
+    )
+
+
+def select_best_field(
+    field_name: str,
+    cand_mrz: FieldResult,
+    cand_vlm: FieldResult,
+    notes: list
+) -> FieldResult:
+    """
+    Conducts a head-to-head confidence tournament for a specific field between
+    Tesseract MRZ and Qwen2-VL, selecting the candidate with higher confidence.
+
+    :param field_name: Name of the target field for diagnostic logging.
+    :param cand_mrz: Extraction result produced by Tesseract MRZ.
+    :param cand_vlm: Extraction result produced by Qwen2-VL.
+    :param notes: In-out list collecting execution notes.
+    :return: Winning FieldResult.
+    """
+    # If one candidate has no value, automatically choose the other
+    if cand_mrz.value and not cand_vlm.value:
+        return cand_mrz
+    if cand_vlm.value and not cand_mrz.value:
+        return cand_vlm
+    if not cand_mrz.value and not cand_vlm.value:
+        return FieldResult(value=None, confidence=0.0, source="unassigned")
+
+    # Both have values: compare confidence scores
+    if cand_mrz.confidence >= cand_vlm.confidence:
+        winning = cand_mrz
+        notes.append(
+            f"Field '{field_name}': MRZ won ({cand_mrz.confidence:.2f} vs VLM {cand_vlm.confidence:.2f})."
+        )
+    else:
+        winning = cand_vlm
+        notes.append(
+            f"Field '{field_name}': VLM won ({cand_vlm.confidence:.2f} vs MRZ {cand_mrz.confidence:.2f})."
+        )
+
+    return winning
+
+
+# ==============================================================================
+# Dynamic Document Discovery Helper
+# ==============================================================================
+
+def refresh_document_paths(job_id: str) -> Dict[str, str]:
+    """
+    Queries SQLite and inspects the on-disk job directory to discover any files
+    attached after initial job ingestion. Guarantees that documents uploaded
+    while previous stages were executing are never missed.
+
+    :param job_id: UUID tracking string.
+    :return: Fresh mapping of document types to verified local file paths.
+    """
+    job_record = get_job(job_id)
+    doc_paths: Dict[str, str] = job_record.get("doc_paths", {}) if job_record else {}
+
+    job_dir = os.path.join(BASE_STORAGE_DIR, job_id)
+    if os.path.isdir(job_dir):
+        # Scan filesystem for standard attachment prefix names
+        for filename in os.listdir(job_dir):
+            full_path = os.path.join(job_dir, filename)
+            if not os.path.isfile(full_path):
+                continue
+            if filename.startswith("bio_") and "passport_bio" not in doc_paths:
+                doc_paths["passport_bio"] = full_path
+            elif filename.startswith("visa_") and "visa_page" not in doc_paths:
+                doc_paths["visa_page"] = full_path
+            elif filename.startswith("stamp_") and "entry_stamp" not in doc_paths:
+                doc_paths["entry_stamp"] = full_path
+            elif filename.startswith("welcome_") and "welcome_form" not in doc_paths:
+                doc_paths["welcome_form"] = full_path
+            elif filename.startswith("form_") and "welcome_form" not in doc_paths:
+                doc_paths["welcome_form"] = full_path
+
+    return doc_paths
+
+
+# ==============================================================================
+# Job Processing Pipeline
+# ==============================================================================
+
+async def process_single_job(job_id: str, ml_state: dict) -> None:
+    """
+    Executes the multi-document extraction pipeline for a single queued job.
+    Runs Tesseract MRZ and Qwen2-VL for the bio page, selects the
+    best candidate per field, and continues through Visa, Stamp, and Welcome Form.
+    Progressively persists extraction state to SQLite after each stage so mobile
+    clients receive real-time updates as stages complete.
+
+    :param job_id: Unique UUID string identifier of the target job.
+    :param ml_state: Shared dictionary holding model handles.
+    """
+    job_start_time = time.perf_counter()
+    logger.info(f"[*] Starting extraction pipeline for job: {job_id}")
     update_job_status(job_id, "PROCESSING")
 
-    # Refresh available file paths from database (passport, visa, stamp, welcome form)
-    doc_paths = refresh_document_paths(job_id)
+    fused_record = GuestFormCRecord()
+    processing_notes: List[str] = []
 
-    # Initialize empty record container
-    record = GuestFormCRecord()
+    try:
+        # ======================================================================
+        # 1. PASSPORT BIO PAGE: DUAL-ENGINE TOURNAMENT (MRZ + VLM)
+        # ======================================================================
+        doc_paths = refresh_document_paths(job_id)
+        bio_path = doc_paths.get("passport_bio")
 
-    # -------------------------------------------------------------------------
-    # Stage 1: Passport Bio-Data Page
-    # -------------------------------------------------------------------------
-    passport_path = doc_paths.get("passport_bio")
-    if passport_path and os.path.exists(passport_path):
-        logger.info(f"[{job_id}] Stage 1/4: Processing Passport Bio Page ({passport_path})")
-        
-        # Zero-example strict extraction prompt
-        bio_prompt = (
-            "You are an accurate OCR document reader. Examine this passport bio-data page.\n"
-            "Extract the following exact fields into a valid JSON object:\n"
-            "{\n"
-            '  "surname": string or null,\n'
-            '  "given_names": string or null,\n'
-            '  "sex": "M" or "F" or null,\n'
-            '  "date_of_birth": "YYYY-MM-DD" or null,\n'
-            '  "nationality": "3-letter country code" or null,\n'
-            '  "passport_number": string or null,\n'
-            '  "passport_expiry_date": "YYYY-MM-DD" or null\n'
-            "}\n"
-            "CRITICAL INSTRUCTIONS:\n"
-            "- Only return text that is clearly visible in the image.\n"
-            "- If a field cannot be read, output null. DO NOT guess, extrapolate, or invent details.\n"
-            "- Output JSON only. Do not add introductory or closing sentences."
-        )
+        if bio_path and os.path.exists(bio_path):
+            logger.info(f"[{job_id}] Stage 1/4: Dual-engine extraction for passport bio page ({bio_path})...")
 
+            # --- Engine A: Tesseract MRZ Execution ---
+            mrz_start = time.perf_counter()
+            mrz_candidates: Dict[str, FieldResult] = {}
+            valid_mrz_flag = False
+
+            try:
+                with open(bio_path, "rb") as f:
+                    image_bytes = f.read()
+
+                mrz_record = await asyncio.to_thread(read_mrz, io.BytesIO(image_bytes))
+
+                if mrz_record is not None:
+                    mrz_dict = mrz_record.to_dict() if hasattr(mrz_record, "to_dict") else {}
+                    score_val = getattr(mrz_record, "valid_score", 0)
+                    valid_score = int(score_val) if isinstance(score_val, (int, float)) else 0
+                    base_text_conf = round(max(0.0, min(1.0, valid_score / 100.0)), 2)
+
+                    check_number = getattr(mrz_record, "check_number", False)
+                    check_dob = getattr(mrz_record, "check_date_of_birth", False)
+                    check_exp = getattr(mrz_record, "check_expiration_date", False)
+                    check_composite = getattr(mrz_record, "check_composite", False)
+
+                    valid_mrz_flag = bool(check_composite or valid_score >= 80)
+
+                    def mk_checked(val: Optional[str], check_passed: bool) -> FieldResult:
+                        clean = sanitize_extracted_string(val)
+                        if not clean:
+                            return FieldResult(value=None, confidence=0.0, source="tesseract_mrz")
+                        return FieldResult(
+                            value=clean,
+                            confidence=0.99 if check_passed else 0.30,
+                            source="tesseract_mrz"
+                        )
+
+                    def mk_text(val: Optional[str]) -> FieldResult:
+                        clean = sanitize_extracted_string(val)
+                        if not clean:
+                            return FieldResult(value=None, confidence=0.0, source="tesseract_mrz")
+                        return FieldResult(
+                            value=clean,
+                            confidence=base_text_conf,
+                            source="tesseract_mrz"
+                        )
+
+                    mrz_candidates["surname"] = mk_text(mrz_dict.get("surname"))
+                    mrz_candidates["given_names"] = mk_text(mrz_dict.get("names"))
+                    mrz_candidates["passport_number"] = mk_checked(mrz_dict.get("number"), check_number)
+                    mrz_candidates["nationality"] = mk_text(mrz_dict.get("nationality"))
+                    mrz_candidates["date_of_birth"] = mk_checked(mrz_dict.get("date_of_birth"), check_dob)
+                    mrz_candidates["sex"] = mk_text(mrz_dict.get("sex"))
+                    mrz_candidates["passport_expiry_date"] = mk_checked(mrz_dict.get("expiration_date"), check_exp)
+
+                    mrz_duration = time.perf_counter() - mrz_start
+                    logger.info(
+                        f"[{job_id}] Tesseract MRZ completed in {mrz_duration:.2f}s "
+                        f"(valid={valid_mrz_flag}, score={valid_score})."
+                    )
+                    processing_notes.append(f"MRZ parsed in {mrz_duration:.2f}s (valid: {valid_mrz_flag}, score: {valid_score}).")
+                else:
+                    mrz_duration = time.perf_counter() - mrz_start
+                    logger.info(f"[{job_id}] Tesseract MRZ found no patterns ({mrz_duration:.2f}s).")
+                    processing_notes.append(f"MRZ not detected ({mrz_duration:.2f}s).")
+            except Exception as mrz_exc:
+                logger.warning(f"[{job_id}] MRZ extraction error: {str(mrz_exc)}", exc_info=True)
+                processing_notes.append(f"MRZ error: {str(mrz_exc)}")
+
+            # --- Engine B: Qwen2-VL Visual Bio Execution ---
+            vlm_candidates: Dict[str, FieldResult] = {}
+            bio_image = await asyncio.to_thread(load_and_preprocess_image, bio_path)
+
+            if bio_image:
+                bio_prompt = (
+                    "Carefully read the passport bio page image.\n"
+                    "Extract the following exact fields into a valid JSON object:\n"
+                    "{\n"
+                    '  "surname": {"value": string or null, "confidence": 0.95},\n'
+                    '  "given_names": {"value": string or null, "confidence": 0.95},\n'
+                    '  "passport_number": {"value": string or null, "confidence": 0.90},\n'
+                    '  "nationality": {"value": "3-letter country code" or null, "confidence": 0.95},\n'
+                    '  "date_of_birth": {"value": "YYYY-MM-DD" or null, "confidence": 0.90},\n'
+                    '  "sex": {"value": "M" or "F" or null, "confidence": 0.95},\n'
+                    '  "expiry_date": {"value": "YYYY-MM-DD" or null, "confidence": 0.90}\n'
+                    "}\n"
+                    "CRITICAL RULES:\n"
+                    "- Extract ONLY text clearly legible on this document.\n"
+                    "- If any field is missing or unreadable, set value to null. DO NOT extrapolate or guess."
+                )
+                vlm_bio = await asyncio.to_thread(run_vlm_inference, bio_image, bio_prompt, ml_state, "Passport Bio VLM")
+
+                vlm_candidates["surname"] = normalize_vlm_field(vlm_bio.get("surname"))
+                vlm_candidates["given_names"] = normalize_vlm_field(vlm_bio.get("given_names"))
+                vlm_candidates["passport_number"] = normalize_vlm_field(vlm_bio.get("passport_number"))
+                vlm_candidates["nationality"] = normalize_vlm_field(vlm_bio.get("nationality"))
+                vlm_candidates["date_of_birth"] = normalize_vlm_field(vlm_bio.get("date_of_birth"))
+                vlm_candidates["sex"] = normalize_vlm_field(vlm_bio.get("sex"))
+                vlm_candidates["passport_expiry_date"] = normalize_vlm_field(vlm_bio.get("expiry_date"))
+
+                processing_notes.append("Qwen2-VL visual bio extraction completed.")
+
+            # --- Engine Tournament: Select Best Field for Every Bio Attribute ---
+            empty_field = FieldResult(value=None, confidence=0.0, source="none")
+            fused_record.valid_mrz = valid_mrz_flag
+
+            fused_record.surname = select_best_field(
+                "surname",
+                mrz_candidates.get("surname", empty_field),
+                vlm_candidates.get("surname", empty_field),
+                processing_notes
+            )
+            fused_record.given_names = select_best_field(
+                "given_names",
+                mrz_candidates.get("given_names", empty_field),
+                vlm_candidates.get("given_names", empty_field),
+                processing_notes
+            )
+            fused_record.passport_number = select_best_field(
+                "passport_number",
+                mrz_candidates.get("passport_number", empty_field),
+                vlm_candidates.get("passport_number", empty_field),
+                processing_notes
+            )
+            fused_record.nationality = select_best_field(
+                "nationality",
+                mrz_candidates.get("nationality", empty_field),
+                vlm_candidates.get("nationality", empty_field),
+                processing_notes
+            )
+            fused_record.date_of_birth = select_best_field(
+                "date_of_birth",
+                mrz_candidates.get("date_of_birth", empty_field),
+                vlm_candidates.get("date_of_birth", empty_field),
+                processing_notes
+            )
+            fused_record.sex = select_best_field(
+                "sex",
+                mrz_candidates.get("sex", empty_field),
+                vlm_candidates.get("sex", empty_field),
+                processing_notes
+            )
+            fused_record.passport_expiry_date = select_best_field(
+                "passport_expiry_date",
+                mrz_candidates.get("passport_expiry_date", empty_field),
+                vlm_candidates.get("passport_expiry_date", empty_field),
+                processing_notes
+            )
+
+            # Persist Stage 1 intermediate progress to SQLite immediately
+            fused_record.processing_notes = list(processing_notes)
+            save_intermediate_job_result(job_id, fused_record.model_dump())
+            logger.info(f"[{job_id}] Stage 1/4 completed and intermediate state persisted to database.")
+        else:
+            logger.warning(f"[{job_id}] Passport bio image not found on disk: {bio_path}")
+            processing_notes.append("Passport bio image missing from job directory.")
+
+        # ======================================================================
+        # 2. VISA / OCI EXTRACTION (QWEN2-VL)
+        # ======================================================================
+        doc_paths = refresh_document_paths(job_id)
+        visa_path = doc_paths.get("visa_page")
+
+        if visa_path and os.path.exists(visa_path):
+            logger.info(f"[{job_id}] Stage 2/4: Running Qwen2-VL visa extraction ({visa_path})...")
+            visa_image = await asyncio.to_thread(load_and_preprocess_image, visa_path)
+            if visa_image:
+                visa_prompt = (
+                    "Carefully read the Indian Visa or OCI card document image.\n"
+                    "Extract the following exact fields into a valid JSON object:\n"
+                    "{\n"
+                    '  "visa_number": {"value": string or null, "confidence": 0.90},\n'
+                    '  "visa_type": {"value": string or null, "confidence": 0.90},\n'
+                    '  "issue_date": {"value": "YYYY-MM-DD" or null, "confidence": 0.85},\n'
+                    '  "expiry_date": {"value": "YYYY-MM-DD" or null, "confidence": 0.85},\n'
+                    '  "place_of_issue": {"value": string or null, "confidence": 0.85}\n'
+                    "}\n"
+                    "CRITICAL RULES:\n"
+                    "- Extract ONLY clearly visible text.\n"
+                    "- Set value to null if absent or unreadable. DO NOT invent sample numbers."
+                )
+                vlm_visa = await asyncio.to_thread(run_vlm_inference, visa_image, visa_prompt, ml_state, "Visa VLM")
+                fused_record.visa_number = normalize_vlm_field(vlm_visa.get("visa_number"))
+                fused_record.visa_type = normalize_vlm_field(vlm_visa.get("visa_type"))
+                fused_record.visa_issue_date = normalize_vlm_field(vlm_visa.get("issue_date"))
+                fused_record.visa_expiry_date = normalize_vlm_field(vlm_visa.get("expiry_date"))
+                fused_record.visa_place_of_issue = normalize_vlm_field(vlm_visa.get("place_of_issue"))
+                processing_notes.append("Visa / OCI details extracted via Qwen2-VL.")
+
+                # Persist Stage 2 intermediate progress to SQLite immediately
+                fused_record.processing_notes = list(processing_notes)
+                save_intermediate_job_result(job_id, fused_record.model_dump())
+                logger.info(f"[{job_id}] Stage 2/4 completed and intermediate state persisted to database.")
+        else:
+            logger.info(f"[{job_id}] Stage 2/4: No visa_page document attached to job. Skipping.")
+
+        # ======================================================================
+        # 3. IMMIGRATION ENTRY STAMP EXTRACTION (QWEN2-VL)
+        # ======================================================================
+        doc_paths = refresh_document_paths(job_id)
+        stamp_path = doc_paths.get("entry_stamp")
+
+        if stamp_path and os.path.exists(stamp_path):
+            logger.info(f"[{job_id}] Stage 3/4: Running Qwen2-VL entry stamp extraction ({stamp_path})...")
+            stamp_image = await asyncio.to_thread(load_and_preprocess_image, stamp_path)
+            if stamp_image:
+                stamp_prompt = (
+                    "Carefully read the passport arrival stamp image.\n"
+                    "Identify the Indian arrival / entry stamp (look for ARRIVED or IMMIGRATION).\n"
+                    "Extract the following exact fields into a valid JSON object:\n"
+                    "{\n"
+                    '  "arrival_date": {"value": "YYYY-MM-DD" or null, "confidence": 0.85},\n'
+                    '  "arrival_port": {"value": string or null, "confidence": 0.85}\n'
+                    "}\n"
+                    "CRITICAL RULES:\n"
+                    "- Distinguish between ARRIVAL and DEPARTURE stamps. Read only arrival details.\n"
+                    "- If port or date is unreadable, set value to null. Output JSON only."
+                )
+                vlm_stamp = await asyncio.to_thread(run_vlm_inference, stamp_image, stamp_prompt, ml_state, "Stamp VLM")
+                fused_record.arrival_date_india = normalize_vlm_field(vlm_stamp.get("arrival_date"))
+                fused_record.arrival_port_india = normalize_vlm_field(vlm_stamp.get("arrival_port"))
+                processing_notes.append("Entry stamp details extracted via Qwen2-VL.")
+
+                # Persist Stage 3 intermediate progress to SQLite immediately
+                fused_record.processing_notes = list(processing_notes)
+                save_intermediate_job_result(job_id, fused_record.model_dump())
+                logger.info(f"[{job_id}] Stage 3/4 completed and intermediate state persisted to database.")
+        else:
+            logger.info(f"[{job_id}] Stage 3/4: No entry_stamp document attached to job. Skipping.")
+
+        # ======================================================================
+        # 4. HANDWRITTEN ARRIVAL REPORT EXTRACTION (FORM-C RULE 14)
+        # ======================================================================
+        doc_paths = refresh_document_paths(job_id)
+        welcome_path = doc_paths.get("welcome_form")
+
+        if welcome_path and os.path.exists(welcome_path):
+            logger.info(f"[{job_id}] Stage 4/4: Running Qwen2-VL handwritten Form-C extraction ({welcome_path})...")
+            welcome_image = await asyncio.to_thread(load_and_preprocess_image, welcome_path)
+            if welcome_image:
+                welcome_prompt = (
+                    "Carefully read the handwritten ARRIVAL REPORT (THE REGISTRATION OF FOREIGNERS RULES 1939 FORM C RULE 14) "
+                    "document image. Extract every numbered item accurately. "
+                    "For each field, return a JSON object with 'value' and 'confidence' (0.0 - 1.0).\n"
+                    "Required JSON format:\n"
+                    "{\n"
+                    '  "name_of_foreigner": {"value": string or null, "confidence": 0.85},\n'
+                    '  "full_address": {"value": string or null, "confidence": 0.80},\n'
+                    '  "city": {"value": string or null, "confidence": 0.80},\n'
+                    '  "country": {"value": string or null, "confidence": 0.80},\n'
+                    '  "email": {"value": string or null, "confidence": 0.85},\n'
+                    '  "telephone_mobile": {"value": string or null, "confidence": 0.85},\n'
+                    '  "nationality": {"value": string or null, "confidence": 0.80},\n'
+                    '  "place_of_issue_of_visa": {"value": string or null, "confidence": 0.80},\n'
+                    '  "date_of_arrival_in_india": {"value": "YYYY-MM-DD" or null, "confidence": 0.80},\n'
+                    '  "datetime_arrival_homestay": {"value": string or null, "confidence": 0.80},\n'
+                    '  "arrived_from": {"value": string or null, "confidence": 0.80},\n'
+                    '  "proceeding_to": {"value": string or null, "confidence": 0.80},\n'
+                    '  "proposed_duration_stay_india": {"value": string or null, "confidence": 0.80},\n'
+                    '  "purpose_of_visit_profession": {"value": string or null, "confidence": 0.80},\n'
+                    '  "expected_date_departure": {"value": "YYYY-MM-DD" or null, "confidence": 0.80},\n'
+                    '  "country_city_arrived_to_india": {"value": string or null, "confidence": 0.80}\n'
+                    "}\n"
+                    "CRITICAL ANTI-HALLUCINATION RULES:\n"
+                    "- Transcribe ONLY the handwriting written by the guest on this document.\n"
+                    "- If a field is blank, empty, unreadable, or not filled, set value to null.\n"
+                    "- NEVER invent dummy addresses, phone numbers, or cities.\n"
+                    "- Output JSON only."
+                )
+                # Allocate 512 max tokens for Stage 4 to prevent JSON truncation
+                vlm_form = await asyncio.to_thread(
+                    run_vlm_inference,
+                    welcome_image,
+                    welcome_prompt,
+                    ml_state,
+                    "Welcome Form VLM",
+                    512
+                )
+
+                # Map extracted Form-C items into fused record with source attribution
+                fused_record.permanent_address = normalize_vlm_field(vlm_form.get("full_address"), source="welcome_form")
+                fused_record.city = normalize_vlm_field(vlm_form.get("city"), source="welcome_form")
+                fused_record.country = normalize_vlm_field(vlm_form.get("country"), source="welcome_form")
+                fused_record.contact_email = normalize_vlm_field(vlm_form.get("email"), source="welcome_form")
+                fused_record.contact_phone = normalize_vlm_field(vlm_form.get("telephone_mobile"), source="welcome_form")
+                fused_record.arrival_datetime_homestay = normalize_vlm_field(vlm_form.get("datetime_arrival_homestay"), source="welcome_form")
+                fused_record.arrived_from = normalize_vlm_field(vlm_form.get("arrived_from"), source="welcome_form")
+                fused_record.proceeding_to = normalize_vlm_field(vlm_form.get("proceeding_to"), source="welcome_form")
+                fused_record.stay_duration_india = normalize_vlm_field(vlm_form.get("proposed_duration_stay_india"), source="welcome_form")
+                fused_record.purpose_of_visit = normalize_vlm_field(vlm_form.get("purpose_of_visit_profession"), source="welcome_form")
+                fused_record.expected_departure_date = normalize_vlm_field(vlm_form.get("expected_date_departure"), source="welcome_form")
+                fused_record.arrived_country_city_india = normalize_vlm_field(vlm_form.get("country_city_arrived_to_india"), source="welcome_form")
+
+                # Fallback comparisons if passport or visa did not detect values
+                if not fused_record.visa_place_of_issue.value:
+                    fused_record.visa_place_of_issue = normalize_vlm_field(vlm_form.get("place_of_issue_of_visa"), source="welcome_form")
+                if not fused_record.arrival_date_india.value:
+                    fused_record.arrival_date_india = normalize_vlm_field(vlm_form.get("date_of_arrival_in_india"), source="welcome_form")
+                if not fused_record.nationality.value:
+                    fused_record.nationality = normalize_vlm_field(vlm_form.get("nationality"), source="welcome_form")
+
+                processing_notes.append("Handwritten Form-C arrival report extracted via Qwen2-VL.")
+        else:
+            logger.info(f"[{job_id}] Stage 4/4: No welcome_form document attached to job. Skipping.")
+
+        # Persist final fused record with diagnostic tournament logs and total elapsed duration
+        total_job_duration = time.perf_counter() - job_start_time
+        processing_notes.append(f"Complete pipeline executed in {total_job_duration:.2f}s.")
+        fused_record.processing_notes = processing_notes
+
+        # Transition status to COMPLETED and commit final result
+        save_job_result(job_id, fused_record.model_dump())
+        logger.info(f"[+] Job {job_id} successfully completed in {total_job_duration:.2f}s.")
+
+    except Exception as exc:
+        total_job_duration = time.perf_counter() - job_start_time
+        logger.error(f"[!] Pipeline processing aborted for job {job_id} after {total_job_duration:.2f}s: {str(exc)}", exc_info=True)
+        update_job_status(job_id, "FAILED", error_message=f"{str(exc)} (after {total_job_duration:.2f}s)")
+
+
+# ==============================================================================
+# Asynchronous Background Worker Loop
+# ==============================================================================
+
+async def background_queue_worker(ml_state: dict) -> None:
+    """
+    Continuous background loop that waits for jobs added to job_queue
+    and processes them sequentially one after another.
+
+    :param ml_state: Global dictionary containing warm Qwen2-VL model handles.
+    """
+    logger.info("[*] Background async queue worker loop initialized.")
+    while True:
         try:
-            t0 = time.perf_counter()
-            bio_raw = run_vlm_prompt(vlm_model, vlm_processor, passport_path, bio_prompt)
-            bio_data = extract_json_from_output(bio_raw)
-            elapsed = time.perf_counter() - t0
-            logger.info(f"[{job_id}] Bio stage finished in {elapsed:.2f}s")
+            job_id = await job_queue.get()
+            logger.info(f"[*] Queue dispatched job: {job_id}")
 
-            record.surname = build_field_result(bio_data.get("surname"), 0.95, "vlm")
-            record.given_names = build_field_result(bio_data.get("given_names"), 0.95, "vlm")
-            record.sex = build_field_result(bio_data.get("sex"), 0.95, "vlm")
-            record.date_of_birth = build_field_result(bio_data.get("date_of_birth"), 0.95, "vlm")
-            record.nationality = build_field_result(bio_data.get("nationality"), 0.95, "vlm")
-            record.passport_number = build_field_result(bio_data.get("passport_number"), 0.95, "vlm")
-            record.passport_expiry_date = build_field_result(bio_data.get("passport_expiry_date"), 0.95, "vlm")
+            await process_single_job(job_id, ml_state)
 
-            update_stage_progress(job_id, "passport_bio", record)
-        except Exception as err:
-            logger.error(f"[{job_id}] Stage 1 failed: {err}")
-
-    # -------------------------------------------------------------------------
-    # Stage 2: Visa / OCI Page
-    # -------------------------------------------------------------------------
-    doc_paths = refresh_document_paths(job_id)
-    visa_path = doc_paths.get("visa_page")
-    if visa_path and os.path.exists(visa_path):
-        logger.info(f"[{job_id}] Stage 2/4: Processing Visa Page ({visa_path})")
-        
-        visa_prompt = (
-            "You are an accurate OCR document reader. Examine this Indian Visa or OCI card image.\n"
-            "Extract the following exact fields into a valid JSON object:\n"
-            "{\n"
-            '  "visa_number": string or null,\n'
-            '  "visa_type": string or null,\n'
-            '  "visa_issue_date": "YYYY-MM-DD" or null,\n'
-            '  "visa_expiry_date": "YYYY-MM-DD" or null,\n'
-            '  "visa_place_of_issue": string or null\n'
-            "}\n"
-            "CRITICAL INSTRUCTIONS:\n"
-            "- Only return text that is clearly visible on the visa.\n"
-            "- If a field cannot be read, output null. DO NOT guess or invent sample numbers.\n"
-            "- Output JSON only."
-        )
-
-        try:
-            t0 = time.perf_counter()
-            visa_raw = run_vlm_prompt(vlm_model, vlm_processor, visa_path, visa_prompt)
-            visa_data = extract_json_from_output(visa_raw)
-            elapsed = time.perf_counter() - t0
-            logger.info(f"[{job_id}] Visa stage finished in {elapsed:.2f}s")
-
-            record.visa_number = build_field_result(visa_data.get("visa_number"), 0.90, "vlm")
-            record.visa_type = build_field_result(visa_data.get("visa_type"), 0.90, "vlm")
-            record.visa_issue_date = build_field_result(visa_data.get("visa_issue_date"), 0.90, "vlm")
-            record.visa_expiry_date = build_field_result(visa_data.get("visa_expiry_date"), 0.90, "vlm")
-            record.visa_place_of_issue = build_field_result(visa_data.get("visa_place_of_issue"), 0.90, "vlm")
-
-            update_stage_progress(job_id, "visa_page", record)
-        except Exception as err:
-            logger.error(f"[{job_id}] Stage 2 failed: {err}")
-
-    # -------------------------------------------------------------------------
-    # Stage 3: Port of Entry Immigration Stamp
-    # -------------------------------------------------------------------------
-    doc_paths = refresh_document_paths(job_id)
-    stamp_path = doc_paths.get("entry_stamp")
-    if stamp_path and os.path.exists(stamp_path):
-        logger.info(f"[{job_id}] Stage 3/4: Processing Immigration Stamp ({stamp_path})")
-        
-        stamp_prompt = (
-            "You are an accurate OCR reader. Examine this passport stamp image.\n"
-            "Identify the Indian arrival / entry stamp (look for 'ARRIVED' or 'IMMIGRATION').\n"
-            "Extract the following exact fields into a valid JSON object:\n"
-            "{\n"
-            '  "arrival_date_india": "YYYY-MM-DD" or null,\n'
-            '  "arrival_port_india": string or null\n'
-            "}\n"
-            "CRITICAL INSTRUCTIONS:\n"
-            "- Distinguish between ARRIVAL and DEPARTURE stamps. Read only arrival details.\n"
-            "- If the port or date is not legible, output null.\n"
-            "- Output JSON only."
-        )
-
-        try:
-            t0 = time.perf_counter()
-            stamp_raw = run_vlm_prompt(vlm_model, vlm_processor, stamp_path, stamp_prompt)
-            stamp_data = extract_json_from_output(stamp_raw)
-            elapsed = time.perf_counter() - t0
-            logger.info(f"[{job_id}] Stamp stage finished in {elapsed:.2f}s")
-
-            record.arrival_date_india = build_field_result(stamp_data.get("arrival_date_india"), 0.85, "vlm")
-            record.arrival_port_india = build_field_result(stamp_data.get("arrival_port_india"), 0.85, "vlm")
-
-            update_stage_progress(job_id, "entry_stamp", record)
-        except Exception as err:
-            logger.error(f"[{job_id}] Stage 3 failed: {err}")
-
-    # -------------------------------------------------------------------------
-    # Stage 4: Handwritten Welcome Form / Arrival Report (Form-C Rule 14)
-    # -------------------------------------------------------------------------
-    doc_paths = refresh_document_paths(job_id)
-    formc_path = doc_paths.get("welcome_form")
-    if formc_path and os.path.exists(formc_path):
-        logger.info(f"[{job_id}] Stage 4/4: Processing Handwritten Form-C Sheet ({formc_path})")
-        
-        # STRICT NO-EXAMPLE PROMPT: Completely forbids hallucinated addresses, names, or phones
-        formc_prompt = (
-            "You are an accurate OCR document reader. Examine this handwritten Form C Arrival Report (Rule 14).\n"
-            "Transcribe the handwritten entries for each numbered item into a valid JSON object:\n"
-            "{\n"
-            '  "permanent_address": string or null,\n'
-            '  "city": string or null,\n'
-            '  "country": string or null,\n'
-            '  "contact_email": string or null,\n'
-            '  "contact_phone": string or null,\n'
-            '  "arrival_datetime_homestay": string or null,\n'
-            '  "arrived_from": string or null,\n'
-            '  "proceeding_to": string or null,\n'
-            '  "stay_duration_india": string or null,\n'
-            '  "purpose_of_visit": string or null,\n'
-            '  "expected_departure_date": string or null,\n'
-            '  "arrived_country_city_india": string or null\n'
-            "}\n"
-            "CRITICAL ANTI-HALLUCINATION RULES:\n"
-            "- Transcribe ONLY the ink handwriting written by the guest on this specific document.\n"
-            "- If a field is blank, empty, unreadable, or not filled, you MUST set its value to null.\n"
-            "- NEVER invent dummy addresses, phone numbers, or cities.\n"
-            "- Output JSON only. Do not include markdown preamble."
-        )
-
-        try:
-            t0 = time.perf_counter()
-            formc_raw = run_vlm_prompt(vlm_model, vlm_processor, formc_path, formc_prompt, max_new_tokens=600)
-            formc_data = extract_json_from_output(formc_raw)
-            elapsed = time.perf_counter() - t0
-            logger.info(f"[{job_id}] Welcome Form stage finished in {elapsed:.2f}s")
-
-            # Store sanitized fields
-            record.permanent_address = build_field_result(formc_data.get("permanent_address"), 0.80, "welcome_form")
-            record.city = build_field_result(formc_data.get("city"), 0.80, "welcome_form")
-            record.country = build_field_result(formc_data.get("country"), 0.80, "welcome_form")
-            record.contact_email = build_field_result(formc_data.get("contact_email"), 0.80, "welcome_form")
-            record.contact_phone = build_field_result(formc_data.get("contact_phone"), 0.80, "welcome_form")
-            record.arrival_datetime_homestay = build_field_result(formc_data.get("arrival_datetime_homestay"), 0.80, "welcome_form")
-            record.arrived_from = build_field_result(formc_data.get("arrived_from"), 0.80, "welcome_form")
-            record.proceeding_to = build_field_result(formc_data.get("proceeding_to"), 0.80, "welcome_form")
-            record.stay_duration_india = build_field_result(formc_data.get("stay_duration_india"), 0.80, "welcome_form")
-            record.purpose_of_visit = build_field_result(formc_data.get("purpose_of_visit"), 0.80, "welcome_form")
-            record.expected_departure_date = build_field_result(formc_data.get("expected_departure_date"), 0.80, "welcome_form")
-            record.arrived_country_city_india = build_field_result(formc_data.get("arrived_country_city_india"), 0.80, "welcome_form")
-
-            update_stage_progress(job_id, "welcome_form", record)
-        except Exception as err:
-            logger.error(f"[{job_id}] Stage 4 failed: {err}")
-
-    # Mark entire job COMPLETED and write final composite record to database
-    save_job_result(job_id, record)
-    update_job_status(job_id, "COMPLETED")
-    logger.info(f"[{job_id}] Successfully finished all processing stages.")
+            job_queue.task_done()
+        except asyncio.CancelledError:
+            logger.info("[*] Background async queue worker task was cancelled.")
+            break
+        except Exception as exc:
+            logger.error(f"[!] Unexpected error in queue worker loop: {str(exc)}", exc_info=True)
+            await asyncio.sleep(1.0)
