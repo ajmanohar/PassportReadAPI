@@ -8,11 +8,11 @@
 #
 # Server-Side Document Normalization:
 # - Applies EXIF transposition to correct camera orientation tags.
-# - Automatically detects rotated/landscape documents using Tesseract OSD and rotates them upright.
+# - High-confidence OSD thresholding: Ignores low-confidence (< 2.0) or non-Latin OSD false positives.
 # - Neutral administrative archival prompts preventing safety refusal triggers.
 # - Dynamic visual token bounding respecting per-stage patch ceilings.
 # - High-definition visual patch allocation for fine cursive handwriting.
-# - OCR-Assisted Grounding: Supplies raw Tesseract text tokens as context hints to Qwen2-VL.
+# - OCR-Assisted Grounding: Supplies raw native Tesseract text tokens as context hints to Qwen2-VL.
 # - Resilient Queue Ingestion: Safely handles both raw UUID strings and startup recovery dicts.
 # ==============================================================================
 
@@ -86,7 +86,7 @@ def sanitize_extracted_string(val: Optional[str]) -> Optional[str]:
 
 
 # ==============================================================================
-# Image Preparation Helper with Automated Orientation Normalization
+# Image Preparation Helper with Guarded Orientation Normalization
 # ==============================================================================
 
 def load_and_preprocess_image(
@@ -96,12 +96,12 @@ def load_and_preprocess_image(
 ) -> Optional[Image.Image]:
     """
     Loads an image from disk storage, applies EXIF orientation transpositions,
-    standardizes color channels to RGB, checks for orientation misalignments,
+    standardizes color channels to RGB, verifies orientation with confidence guardrails,
     and scales proportionally if the maximum dimension exceeds configured limits.
 
     :param file_path: Absolute or relative filesystem path to the image file.
     :param max_dimension: Maximum allowed width or height in pixels. Defaults to settings.max_image_dimension.
-    :param enable_auto_orient: When True, uses Tesseract OSD to upright images stripped of EXIF tags.
+    :param enable_auto_orient: When True, uses Tesseract OSD only if confidence >= 2.0 and script is Latin.
     :return: Prepared PIL Image instance, or None if the file cannot be read.
     """
     if not os.path.exists(file_path):
@@ -122,23 +122,33 @@ def load_and_preprocess_image(
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        # 3. Server-side auto-orientation check for documents stripped of EXIF metadata
-        # If the image was uploaded landscape or inverted, Tesseract OSD detects the required rotation
+        # 3. Guarded auto-orientation check for documents
+        # Only rotate if Tesseract OSD is highly confident (conf >= 2.0) and script is Latin.
+        # This prevents low-confidence false rotations (e.g. conf 0.47 classifying Latin handwriting as Japanese).
         if enable_auto_orient:
             try:
-                # Downsample a quick thumbnail for ultra-fast OSD check to avoid blocking
                 thumb = image.copy()
                 thumb.thumbnail((800, 800), Image.Resampling.LANCZOS)
                 osd_data = pytesseract.image_to_osd(thumb, output_type=pytesseract.Output.DICT)
                 rotate_angle = osd_data.get("rotate", 0)
+                osd_conf = float(osd_data.get("orientation_conf", 0.0))
+                osd_script = osd_data.get("script", "")
 
-                # Rotate image if Tesseract detects 90, 180, or 270 degree rotation with confidence
-                if rotate_angle in [90, 180, 270]:
-                    logger.info(f"[ImageLoader] Tesseract OSD detected {rotate_angle}° rotation. Correcting '{os.path.basename(file_path)}'...")
-                    # PIL rotate is counter-clockwise; rotating by 360 - rotate_angle corrects it
+                logger.info(
+                    f"[ImageLoader] OSD evaluation for '{os.path.basename(file_path)}': "
+                    f"rotate={rotate_angle}°, conf={osd_conf:.2f}, script={osd_script}"
+                )
+
+                # High-confidence threshold guardrail
+                if rotate_angle in [90, 180, 270] and osd_conf >= 2.0 and osd_script == "Latin":
+                    logger.info(f"[ImageLoader] High-confidence OSD detected {rotate_angle}° rotation. Correcting '{os.path.basename(file_path)}'...")
                     image = image.rotate(360 - rotate_angle, expand=True)
+                elif rotate_angle != 0:
+                    logger.info(
+                        f"[ImageLoader] Bypassing OSD {rotate_angle}° rotation due to low confidence ({osd_conf:.2f} < 2.0) "
+                        f"or non-Latin script ('{osd_script}'). Keeping native orientation."
+                    )
             except Exception as osd_err:
-                # OSD might fail on documents with low text density; proceed gracefully without failing
                 logger.debug(f"[ImageLoader] OSD orientation detection bypassed: {osd_err}")
 
         orig_w, orig_h = image.size
@@ -689,7 +699,7 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                 try:
                     raw_ocr_text = await asyncio.to_thread(pytesseract.image_to_string, welcome_raw)
                     ocr_lines = [line.strip() for line in raw_ocr_text.splitlines() if line.strip()]
-                    ocr_summary = "\n".join(ocr_lines[:25])
+                    ocr_summary = "\n".join(ocr_lines[:30])
                     logger.info(f"[{job_id}] Fast OCR character scan finished in {(time.perf_counter() - ocr_start):.2f}s ({len(ocr_lines)} lines).")
                 except Exception as ocr_e:
                     logger.warning(f"[{job_id}] Fast OCR scan skipped: {ocr_e}")
@@ -809,7 +819,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                 fused_record.arrival_datetime_homestay = normalize_vlm_field(vlm_form_bottom.get("datetime_arrival_homestay"), source="welcome_form")
                 fused_record.arrived_from = normalize_vlm_field(vlm_form_bottom.get("arrived_from"), source="welcome_form")
                 fused_record.proceeding_to = normalize_vlm_field(vlm_form_bottom.get("proceeding_to"), source="welcome_form")
-                # Bind proposed_duration_stay_india with fallback check for stay_duration_india
                 fused_record.stay_duration_india = normalize_vlm_field(
                     vlm_form_bottom.get("proposed_duration_stay_india") or vlm_form_bottom.get("stay_duration_india"),
                     source="welcome_form"
