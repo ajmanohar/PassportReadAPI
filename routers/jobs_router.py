@@ -2,7 +2,8 @@
 Modular API router for asynchronous Form-C batch extraction jobs.
 Provides non-blocking intake endpoints for multi-document bundles,
 supports granular supplementary document attachments, automatic background
-worker dispatching, and diagnostic polling routes.
+worker dispatching, diagnostic polling routes, and binary image streaming
+for desktop and mobile document review.
 """
 
 import json
@@ -13,6 +14,7 @@ import uuid
 from typing import List, Optional
 
 from fastapi import APIRouter, File, UploadFile, HTTPException, status
+from fastapi.responses import FileResponse
 from pydantic import ValidationError
 
 # Configuration, database, and schema imports
@@ -155,10 +157,10 @@ async def attach_document_to_job(
     file: UploadFile = File(...)
 ):
     """
-    Attaches secondary captures (visa_page, entry_stamp, welcome_form) to an existing job directory
-    and updates the database path manifest.
+    Attaches secondary captures (visa_page, entry_stamp, welcome_form, guest_photo)
+    to an existing job directory and updates the database path manifest.
     """
-    valid_types = {"visa_page", "entry_stamp", "welcome_form"}
+    valid_types = {"visa_page", "entry_stamp", "welcome_form", "guest_photo"}
     if doc_type not in valid_types:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -239,6 +241,58 @@ async def start_job_processing(job_id: str):
         "job_id": job_id,
         "message": "Job dispatched to background extraction queue."
     }
+
+
+# ==============================================================================
+# Image Streaming Endpoint (Desktop & Mobile Document Review)
+# ==============================================================================
+
+@router.get(
+    "/{job_id}/image/{doc_type}",
+    summary="Retrieve captured document image artifact for desktop review",
+    description="Streams the raw image file (passport_bio, visa_page, entry_stamp, welcome_form, or guest_photo) stored on disk for a specific job."
+)
+async def get_job_document_image(job_id: str, doc_type: str):
+    """
+    Streams the stored binary document image for desktop inspection.
+    First checks SQLite doc_paths manifest, then falls back to directory inspection.
+    """
+    job_record = get_job(job_id)
+    if not job_record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job with ID '{job_id}' not found."
+        )
+
+    doc_paths = job_record.get("doc_paths", {})
+    resolved_path = doc_paths.get(doc_type)
+
+    # If path in database exists and is valid, return it directly
+    if resolved_path and os.path.exists(resolved_path):
+        return FileResponse(resolved_path, media_type="image/jpeg")
+
+    # Fallback heuristic: search directory directly for filename prefixes
+    job_dir = os.path.join(BASE_STORAGE_DIR, job_id)
+    if os.path.exists(job_dir):
+        prefix_mapping = {
+            "passport_bio": ["bio_", "passport_"],
+            "visa_page": ["visa_"],
+            "entry_stamp": ["stamp_"],
+            "welcome_form": ["form_", "welcome_"],
+            "guest_photo": ["guest_photo_", "photo_"]
+        }
+        prefixes = prefix_mapping.get(doc_type, [f"{doc_type}_"])
+        for fname in os.listdir(job_dir):
+            for prefix in prefixes:
+                if fname.lower().startswith(prefix):
+                    candidate = os.path.join(job_dir, fname)
+                    if os.path.isfile(candidate):
+                        return FileResponse(candidate, media_type="image/jpeg")
+
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Document image '{doc_type}' not found for job ID: {job_id}"
+    )
 
 
 # ==============================================================================
