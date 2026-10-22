@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime
 from typing import Dict, Any, Optional, List, Union
 
 from PIL import Image, ImageOps
@@ -53,6 +54,9 @@ BASE_STORAGE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 FORBIDDEN_HALLUCINATIONS: List[str] = [
     "parthasarthy",
     "parthasarathy",
+    "123 main street",
+    "anytown",
+    "123-456-7890",
     "example@domain.com",
     "9876543210",
     "dummy",
@@ -76,8 +80,8 @@ def sanitize_extracted_string(val: Optional[str]) -> Optional[str]:
     if not val:
         return None
     
-    val_clean = str(val).strip()
-    if not val_clean or val_clean.lower() in ["null", "none", "n/a", "unknown", "", "nil"]:
+    val_clean = str(val).strip().strip("\"'").strip()
+    if not val_clean or val_clean.lower() in ["null", "none", "n/a", "unknown", "", "nil", "undefined"]:
         return None
     
     val_lower = val_clean.lower()
@@ -87,6 +91,41 @@ def sanitize_extracted_string(val: Optional[str]) -> Optional[str]:
             return None
             
     return val_clean
+
+
+def parse_mrz_date(raw_mrz_date: Optional[str], is_expiry: bool = False) -> Optional[str]:
+    """
+    Converts a 6-digit ICAO 9303 MRZ date (YYMMDD) into a standard YYYY-MM-DD string.
+
+    :param raw_mrz_date: 6-character date string in YYMMDD format.
+    :param is_expiry: True if parsing an expiry date; False for birth date.
+    :return: Formatted YYYY-MM-DD string, or None if parsing fails.
+    """
+    cleaned = sanitize_extracted_string(raw_mrz_date)
+    if not cleaned or len(cleaned) != 6 or not cleaned.isdigit():
+        return cleaned
+
+    try:
+        yy = int(cleaned[0:2])
+        mm = int(cleaned[2:4])
+        dd = int(cleaned[4:6])
+
+        # Validate month and day boundaries
+        if mm < 1 or mm > 12 or dd < 1 or dd > 31:
+            return cleaned
+
+        current_year = datetime.now().year
+        current_century = (current_year // 100) * 100
+        current_yy = current_year % 100
+
+        if is_expiry:
+            full_year = current_century + yy if yy >= (current_yy - 10) else (current_century + 100) + yy
+        else:
+            full_year = current_century + yy if yy <= current_yy else (current_century - 100) + yy
+
+        return f"{full_year:04d}-{mm:02d}-{dd:02d}"
+    except Exception:
+        return cleaned
 
 
 # ==============================================================================
@@ -112,7 +151,6 @@ def load_and_preprocess_image(
         logger.warning(f"[ImageLoader] File not found on disk: {file_path}")
         return None
 
-    # Resolve default pixel ceiling from application settings
     target_max_dim = max_dimension if max_dimension is not None else settings.max_image_dimension
 
     try:
@@ -464,20 +502,26 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     valid_score = int(score_val) if isinstance(score_val, (int, float)) else 0
                     base_text_conf = round(max(0.0, min(1.0, valid_score / 100.0)), 2)
 
-                    check_number = getattr(mrz_record, "check_number", False)
-                    check_dob = getattr(mrz_record, "check_date_of_birth", False)
-                    check_exp = getattr(mrz_record, "check_expiration_date", False)
-                    check_composite = getattr(mrz_record, "check_composite", False)
+                    # Inspect genuine boolean validity attributes computed by passporteye checksum routines
+                    check_number = bool(getattr(mrz_record, "valid_number", False))
+                    check_dob = bool(getattr(mrz_record, "valid_date_of_birth", False))
+                    check_exp = bool(getattr(mrz_record, "valid_expiration_date", False))
+                    check_composite = bool(getattr(mrz_record, "valid_composite", False))
 
-                    valid_mrz_flag = bool(check_composite or valid_score >= 80)
+                    valid_mrz_flag = bool(check_composite or (valid_score >= 80 and check_number))
 
-                    def mk_checked(val: Optional[str], check_passed: bool) -> FieldResult:
+                    def mk_checked(val: Optional[str], check_passed: bool, is_date: bool = False, is_expiry: bool = False) -> FieldResult:
                         clean = sanitize_extracted_string(val)
                         if not clean:
                             return FieldResult(value=None, confidence=0.0, source="tesseract_mrz")
+                        
+                        # Normalize 6-digit MRZ date representation (YYMMDD) to human-readable YYYY-MM-DD
+                        if is_date:
+                            clean = parse_mrz_date(clean, is_expiry=is_expiry) or clean
+
                         return FieldResult(
                             value=clean,
-                            confidence=0.99 if check_passed else 0.30,
+                            confidence=0.95 if check_passed else 0.30,
                             source="tesseract_mrz"
                         )
 
@@ -495,14 +539,14 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     mrz_candidates["given_names"] = mk_text(mrz_dict.get("names"))
                     mrz_candidates["passport_number"] = mk_checked(mrz_dict.get("number"), check_number)
                     mrz_candidates["nationality"] = mk_text(mrz_dict.get("nationality"))
-                    mrz_candidates["date_of_birth"] = mk_checked(mrz_dict.get("date_of_birth"), check_dob)
+                    mrz_candidates["date_of_birth"] = mk_checked(mrz_dict.get("date_of_birth"), check_dob, is_date=True, is_expiry=False)
                     mrz_candidates["sex"] = mk_text(mrz_dict.get("sex"))
-                    mrz_candidates["passport_expiry_date"] = mk_checked(mrz_dict.get("expiration_date"), check_exp)
+                    mrz_candidates["passport_expiry_date"] = mk_checked(mrz_dict.get("expiration_date"), check_exp, is_date=True, is_expiry=True)
 
                     mrz_duration = time.perf_counter() - mrz_start
                     logger.info(
                         f"[{job_id}] Tesseract MRZ completed in {mrz_duration:.2f}s "
-                        f"(valid={valid_mrz_flag}, score={valid_score})."
+                        f"(valid={valid_mrz_flag}, score={valid_score}, valid_num={check_number})."
                     )
                     processing_notes.append(f"MRZ parsed in {mrz_duration:.2f}s (valid: {valid_mrz_flag}, score: {valid_score}).")
                 else:
@@ -532,6 +576,7 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     "}\n"
                     "Instructions:\n"
                     "- Transcribe only text clearly legible on this document.\n"
+                    "- For passport_number, transcribe the exact alphanumeric string printed in the Visual Inspection Zone (e.g. C9K82159L).\n"
                     "- If any field is missing or unreadable, return null for value and 0.0 for confidence.\n"
                     "- Output JSON only."
                 )
@@ -622,6 +667,8 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     '  "place_of_issue": {"value": string or null, "confidence": float}\n'
                     "}\n"
                     "Instructions:\n"
+                    "- For visa_number, look for 'Visa No', 'Document No', or the bold 7 to 9 character alphanumeric identifier.\n"
+                    "- For visa_type, look for the category such as 'TOURIST', 'T', 'BUSINESS', 'X', 'OCI', or 'STUDENT'.\n"
                     "- If an expiry date is not printed on the document, return null for expiry_date. Do not calculate or assume an expiry date based on the issue date.\n"
                     "- For place_of_issue, transcribe the exact issuing mission or authority printed on the document. If not printed or illegible, return null.\n"
                     "- If any field is missing or unreadable, return null for value and 0.0 for confidence.\n"
@@ -660,7 +707,8 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     "}\n"
                     "Instructions:\n"
                     "- Read only ARRIVAL or ENTRY stamps. Ignore departure or exit stamps.\n"
-                    "- Transcribe the exact port or airport name printed on the arrival stamp. If cut off, smudged, or illegible, return null for value and 0.0 for confidence.\n"
+                    "- Transcribe the exact port or airport name printed on the arrival stamp borders (e.g. 'COCHIN SEAPORT', 'DELHI AIRPORT', 'TRIVANDRUM INTL AIRPORT', 'MUMBAI').\n"
+                    "- If cut off, smudged, or illegible, return null for value and 0.0 for confidence.\n"
                     "- If the arrival date is illegible or not present, return null for value and 0.0 for confidence.\n"
                     "- Output JSON only."
                 )
@@ -693,7 +741,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                 # document is upright before Pass 4A and Pass 4B cropping.
                 # --------------------------------------------------------------
                 try:
-                    w_w, w_h = welcome_raw.size
                     sample_thumb = welcome_raw.copy()
                     sample_thumb.thumbnail((800, 800))
                     t_w, t_h = sample_thumb.size
@@ -722,9 +769,9 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
 
                 # ------------------------------------------------------------------
                 # Pass 4A: Top Section (Rows 1 to 5: Identity, Residence, Visa, Arrival)
-                # Crop top 52% of the document
+                # Crop top 60% of the document to ensure Row 2 sub-grid is fully captured
                 # ------------------------------------------------------------------
-                top_crop_box = (0, 0, img_w, int(img_h * 0.52))
+                top_crop_box = (0, 0, img_w, int(img_h * 0.60))
                 welcome_top_img = welcome_raw.crop(top_crop_box)
                 logger.info(f"[{job_id}] Pass 4A: Cropped top section ({img_w}x{welcome_top_img.size[1]}).")
 
@@ -739,13 +786,16 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
 
                 welcome_top_prompt = (
                     "You are an administrative office assistant digitizing the top section (Rows 1 to 5) of an official Form C (Rule 14) Arrival Report homestay registration card.\n"
-                    "CRITICAL: The card contains pre-printed header letterhead at the top ('HOMESTED, 1386 A, PARVATHY NILAYAM, THAMARAKULAM ROAD, KOCHI'). IGNORE that homestay header completely.\n"
+                    "CRITICAL: The card contains pre-printed letterhead at the top ('HOMESTED, 1386 A, PARVATHY NILAYAM, THAMARAKULAM ROAD, KOCHI - 682 001'). IGNORE that homestay header completely.\n"
                     "Extract ONLY the foreigner guest's handwritten entries in Rows 1 to 5.\n\n"
                     "Here are raw OCR character tokens detected on this top section:\n"
                     f"\"\"\"\n{ocr_top_text}\n\"\"\"\n\n"
                     "Examine the numbered rows on the card:\n"
                     "- Row 1: Name of foreigner (Surname First)\n"
-                    "- Row 2: Full Address (handwritten residential street/town in their home country), City, Country, E-mail, Telephone / Mobile\n"
+                    "- Row 2: Contains 3 horizontal sub-lines:\n"
+                    "    * Line 1: 'Full Address' (handwritten street address in home country)\n"
+                    "    * Line 2: 'City' (handwritten city/town) and 'Country' (handwritten home country)\n"
+                    "    * Line 3: 'E-mail' and 'Telphone / Mobile'\n"
                     "- Row 3: Nationality\n"
                     "- Row 4: Place of issue of visa\n"
                     "- Row 5: Date of Arrival in India\n\n"
@@ -762,12 +812,11 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     '  "date_of_arrival_in_india": {"value": "YYYY-MM-DD" or null, "confidence": float}\n'
                     "}\n"
                     "Instructions:\n"
-                    "- full_address, city, and country MUST be the foreigner's permanent home address written by hand, NOT the Indian homestay address.\n"
+                    "- full_address, city, and country MUST be the foreigner's permanent home address written by hand, NOT 'KOCHI' or 'India' from the homestay letterhead.\n"
                     "- If a line is blank or empty, return null for value and 0.0 for confidence.\n"
                     "- Output JSON only."
                 )
 
-                # Allocate high-definition visual tokens for crisp handwriting reading
                 vlm_form_top = await asyncio.to_thread(
                     run_vlm_inference,
                     welcome_top_img,
@@ -807,9 +856,9 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
 
                 # ------------------------------------------------------------------
                 # Pass 4B: Bottom Section (Rows 6 to 12: Homestay Arrival, Travel & Stay Dates)
-                # Crop bottom 58% of the document (from 0.42 * img_h to img_h) to cleanly capture rows 6 to 12
+                # Crop bottom 55% of the document (from 0.45 * img_h to img_h)
                 # ------------------------------------------------------------------
-                bottom_crop_box = (0, int(img_h * 0.42), img_w, img_h)
+                bottom_crop_box = (0, int(img_h * 0.45), img_w, img_h)
                 welcome_bottom_img = welcome_raw.crop(bottom_crop_box)
                 logger.info(f"[{job_id}] Pass 4B: Cropped bottom section ({img_w}x{welcome_bottom_img.size[1]}).")
 
@@ -827,13 +876,13 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     "Here are raw OCR character tokens detected on this bottom section to guide your reading:\n"
                     f"\"\"\"\n{ocr_bottom_text}\n\"\"\"\n\n"
                     "Examine the numbered table rows on this slip:\n"
-                    "- Row 6: Date and Time of Arrival in the home stay (e.g., date and time like '09.10.16 18:00')\n"
-                    "- Row 7: Arrived from (e.g., state or city like 'KERALA')\n"
-                    "- Row 8: Proceeding to (from here)\n"
-                    "- Row 9: Proposed duration of stay in India\n"
-                    "- Row 10: Purpose of visit & your Profession\n"
-                    "- Row 11: Expected date of departure (from here)\n"
-                    "- Row 12: Country & city you arrived to India\n\n"
+                    "- Row 6: Date and Time of Arrival in the home stay (e.g., '17/5/2026 12:00' or '09.10.16 18:00')\n"
+                    "- Row 7: Arrived from (city or state name written in row 7)\n"
+                    "- Row 8: Proceeding to (from here) (city or state name written in row 8)\n"
+                    "- Row 9: Proposed duration of stay in India (e.g., '2 days' or '1 month')\n"
+                    "- Row 10: Purpose of visit & your Profession (e.g., 'Business', 'Tourism')\n"
+                    "- Row 11: Expected date of departure (from here) (date written in row 11)\n"
+                    "- Row 12: Country & city you arrived to India (written in row 12)\n\n"
                     "Transcribe the genuine handwriting written into each row into this JSON schema:\n"
                     "{\n"
                     '  "datetime_arrival_homestay": {"value": string or null, "confidence": float},\n'
