@@ -46,7 +46,7 @@ from schemas.job import (
     JobStatus,
     GuestFormCRecord
 )
-from services.job_worker import job_queue
+from services.job_worker import safe_enqueue_job
 
 # Configure router logger for diagnostic tracing
 logger = logging.getLogger("jobs_router")
@@ -104,8 +104,7 @@ async def submit_documents_job(
 ) -> JobSubmissionResponse:
     """
     Initializes a new job directory, stores the mandatory passport bio page and any bundled documents,
-    creates a QUEUED record in the SQLite database, and immediately enqueues the worker.
-    Supports both distinct visa formats (visa_document vs visa_stamp) while retaining legacy visa_page.
+    creates a QUEUED record in the SQLite database, and safely enqueues the worker with deduplication.
     """
     # 1. Generate unique job identifier (UUID4) and dedicated disk directory
     job_id = str(uuid.uuid4())
@@ -168,9 +167,9 @@ async def submit_documents_job(
     # 8. Insert initial QUEUED entry into SQLite database
     job_meta = create_job(job_id, doc_paths)
 
-    # 9. Enqueue directly into background worker queue
-    await job_queue.put(job_id)
-    logger.info(f"[*] Ingested job {job_id} and dispatched to processing queue immediately.")
+    # 9. Safely enqueue into background worker queue with duplicate guard
+    await safe_enqueue_job(job_id)
+    logger.info(f"[*] Ingested job {job_id} and dispatched to processing queue safely.")
 
     return JobSubmissionResponse(
         job_id=job_id,
@@ -251,10 +250,9 @@ async def attach_document_to_job(
 )
 async def start_job_processing(job_id: str):
     """
-    Trigger to ensure a job enters the background worker queue.
-    If the job is already PROCESSING or COMPLETED, duplicate execution is blocked.
-    If the job is QUEUED or in an interrupted state, it is added to the in-memory
-    queue so workers can execute it.
+    Trigger to safely enqueue a job for worker processing.
+    Uses safe_enqueue_job() to strictly guard against double-queuing while
+    a job is already waiting in queue, actively processing, or already completed.
     """
     job_record = get_job(job_id)
     if not job_record:
@@ -265,20 +263,15 @@ async def start_job_processing(job_id: str):
 
     current_status = job_record.get("status")
 
-    # Guard: Do not re-run if actively working on it or already successfully finished
-    if current_status in ["PROCESSING", "COMPLETED"]:
-        logger.info(
-            f"[*] Bypassing duplicate queue dispatch for job {job_id} (current status: {current_status})."
-        )
+    # Safe deduplicated enqueue
+    enqueued = await safe_enqueue_job(job_id)
+
+    if not enqueued:
         return {
             "status": current_status,
             "job_id": job_id,
-            "message": f"Job {job_id} is already in state {current_status}; duplicate dispatch skipped."
+            "message": f"Job {job_id} is already in state '{current_status}' or already queued; duplicate dispatch skipped."
         }
-
-    # Put job into the in-memory queue to guarantee worker picks it up
-    await job_queue.put(job_id)
-    logger.info(f"[*] Job {job_id} explicitly dispatched to background execution queue.")
 
     return {
         "status": "QUEUED",
@@ -311,11 +304,9 @@ async def get_job_document_image(job_id: str, doc_type: str):
     doc_paths = job_record.get("doc_paths", {})
     resolved_path = doc_paths.get(doc_type)
 
-    # If path in database exists and is valid on disk, stream it immediately
     if resolved_path and os.path.exists(resolved_path):
         return FileResponse(resolved_path, media_type="image/jpeg")
 
-    # Fallback heuristic: search directory directly for filename prefixes
     job_dir = os.path.join(BASE_STORAGE_DIR, job_id)
     if os.path.exists(job_dir):
         prefix_mapping = {
@@ -363,7 +354,6 @@ async def get_job_status(job_id: str) -> JobDetailResponse:
             detail=f"Job with ID '{job_id}' not found."
         )
 
-    # Defensively map raw dictionary into GuestFormCRecord if processing finished
     result_record: Optional[GuestFormCRecord] = None
     if job_record.get("result"):
         try:
@@ -441,7 +431,6 @@ async def delete_job_and_artifacts(job_id: str) -> JobDeletionResponse:
             detail=f"Job with ID '{job_id}' not found."
         )
 
-    # 1. Count disk image files before purging
     purged_files = 0
     job_dir = os.path.join(BASE_STORAGE_DIR, job_id)
     if os.path.exists(job_dir):
@@ -452,7 +441,6 @@ async def delete_job_and_artifacts(job_id: str) -> JobDeletionResponse:
         except Exception as disk_err:
             logger.warning(f"[*] Error removing disk files for job {job_id}: {disk_err}")
 
-    # 2. Delete row from SQLite
     delete_job_record(job_id)
     logger.info(f"[+] Successfully purged job {job_id} from database and disk storage.")
 
