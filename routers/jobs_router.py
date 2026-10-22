@@ -1,9 +1,22 @@
 """
+==============================================================================
+routers/jobs_router.py - PassportReadAPI
+==============================================================================
 Modular API router for asynchronous Form-C batch extraction jobs.
 Provides non-blocking intake endpoints for multi-document bundles,
 supports granular supplementary document attachments, automatic background
-worker dispatching, diagnostic polling routes, and binary image streaming
-for desktop and mobile document review.
+worker dispatching, diagnostic polling routes, binary image streaming
+for desktop and mobile document review, and cascading job deletion.
+
+Endpoints:
+  - POST   /api/v1/jobs/submit              : Initial intake with passport_bio & optional docs
+  - POST   /api/v1/jobs/{job_id}/attach/{t} : Granular secondary document upload
+  - POST   /api/v1/jobs/{job_id}/start      : Safe trigger to enqueue pending jobs
+  - GET    /api/v1/jobs/{job_id}/image/{t}  : Raw binary JPEG image stream
+  - GET    /api/v1/jobs/{job_id}            : Polling status and composite extraction
+  - GET    /api/v1/jobs                     : Chronological recent jobs listing
+  - DELETE /api/v1/jobs/{job_id}            : Cascade purge of database record & disk images
+==============================================================================
 """
 
 import json
@@ -19,10 +32,17 @@ from pydantic import ValidationError
 
 # Configuration, database, and schema imports
 from config import settings
-from storage.db import create_job, get_job, list_recent_jobs, get_db_connection
+from storage.db import (
+    create_job,
+    get_job,
+    list_recent_jobs,
+    get_db_connection,
+    delete_job_record
+)
 from schemas.job import (
     JobSubmissionResponse,
     JobDetailResponse,
+    JobDeletionResponse,
     JobStatus,
     GuestFormCRecord
 )
@@ -76,14 +96,16 @@ async def save_uploaded_file(upload_file: UploadFile, destination_path: str) -> 
 )
 async def submit_documents_job(
     passport_bio: UploadFile = File(..., description="Passport identity page image containing photo and MRZ lines"),
-    visa_page: Optional[UploadFile] = File(None, description="Optional image of Indian Visa sticker or OCI document page"),
+    visa_document: Optional[UploadFile] = File(None, description="Optional image/PDF of e-Visa paper document"),
+    visa_stamp: Optional[UploadFile] = File(None, description="Optional image of Passport booklet visa ink stamp / vignette"),
+    visa_page: Optional[UploadFile] = File(None, description="Legacy alias: image of Indian Visa sticker or document page"),
     entry_stamp: Optional[UploadFile] = File(None, description="Optional image of Immigration Arrival rubber ink stamp"),
     welcome_form: Optional[UploadFile] = File(None, description="Optional image of physical handwritten Form-C Arrival Report")
 ) -> JobSubmissionResponse:
     """
     Initializes a new job directory, stores the mandatory passport bio page and any bundled documents,
     creates a QUEUED record in the SQLite database, and immediately enqueues the worker.
-    The worker dynamically checks disk for secondary documents before processing them.
+    Supports both distinct visa formats (visa_document vs visa_stamp) while retaining legacy visa_page.
     """
     # 1. Generate unique job identifier (UUID4) and dedicated disk directory
     job_id = str(uuid.uuid4())
@@ -100,21 +122,35 @@ async def submit_documents_job(
         await save_uploaded_file(passport_bio, bio_path)
         doc_paths["passport_bio"] = bio_path
 
-        # 3. Persist optional Visa / OCI image if supplied upfront
-        if visa_page and visa_page.filename:
+        # 3. Persist optional e-Visa Paper Document if supplied
+        if visa_document and visa_document.filename:
+            vdoc_filename = f"visadoc_{visa_document.filename}"
+            vdoc_path = os.path.join(job_dir, vdoc_filename)
+            await save_uploaded_file(visa_document, vdoc_path)
+            doc_paths["visa_document"] = vdoc_path
+
+        # 4. Persist optional Passport Visa Stamp if supplied
+        if visa_stamp and visa_stamp.filename:
+            vstamp_filename = f"visastamp_{visa_stamp.filename}"
+            vstamp_path = os.path.join(job_dir, vstamp_filename)
+            await save_uploaded_file(visa_stamp, vstamp_path)
+            doc_paths["visa_stamp"] = vstamp_path
+
+        # 5. Legacy backward compatibility: persist visa_page if provided
+        if visa_page and visa_page.filename and "visa_document" not in doc_paths and "visa_stamp" not in doc_paths:
             visa_filename = f"visa_{visa_page.filename}"
             visa_path = os.path.join(job_dir, visa_filename)
             await save_uploaded_file(visa_page, visa_path)
             doc_paths["visa_page"] = visa_path
 
-        # 4. Persist optional Entry Stamp image if supplied upfront
+        # 6. Persist optional Entry Stamp image if supplied upfront
         if entry_stamp and entry_stamp.filename:
             stamp_filename = f"stamp_{entry_stamp.filename}"
             stamp_path = os.path.join(job_dir, stamp_filename)
             await save_uploaded_file(entry_stamp, stamp_path)
             doc_paths["entry_stamp"] = stamp_path
 
-        # 5. Persist optional Handwritten Welcome Form image if supplied upfront
+        # 7. Persist optional Handwritten Welcome Form image if supplied upfront
         if welcome_form and welcome_form.filename:
             form_filename = f"form_{welcome_form.filename}"
             form_path = os.path.join(job_dir, form_filename)
@@ -129,10 +165,10 @@ async def submit_documents_job(
             detail=f"Failed to persist uploaded document files: {str(exc)}"
         )
 
-    # 6. Insert initial QUEUED entry into SQLite database
+    # 8. Insert initial QUEUED entry into SQLite database
     job_meta = create_job(job_id, doc_paths)
 
-    # 7. Enqueue directly into background worker queue
+    # 9. Enqueue directly into background worker queue
     await job_queue.put(job_id)
     logger.info(f"[*] Ingested job {job_id} and dispatched to processing queue immediately.")
 
@@ -157,10 +193,17 @@ async def attach_document_to_job(
     file: UploadFile = File(...)
 ):
     """
-    Attaches secondary captures (visa_page, entry_stamp, welcome_form, guest_photo)
+    Attaches secondary captures (visa_document, visa_stamp, visa_page, entry_stamp, welcome_form, guest_photo)
     to an existing job directory and updates the database path manifest.
     """
-    valid_types = {"visa_page", "entry_stamp", "welcome_form", "guest_photo"}
+    valid_types = {
+        "visa_document",
+        "visa_stamp",
+        "visa_page",
+        "entry_stamp",
+        "welcome_form",
+        "guest_photo"
+    }
     if doc_type not in valid_types:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -199,18 +242,19 @@ async def attach_document_to_job(
 
 
 # ==============================================================================
-# Pipeline Execution Trigger Endpoint (Idempotent Guard)
+# Pipeline Execution Trigger Endpoint
 # ==============================================================================
 
 @router.post(
     "/{job_id}/start",
-    summary="Ensure background batch extraction is queued"
+    summary="Ensure background batch extraction is queued and running"
 )
 async def start_job_processing(job_id: str):
     """
-    Idempotent trigger to enqueue a job if it has not yet entered the worker queue.
-    If the job is already QUEUED, PROCESSING, or COMPLETED, it safely bypasses
-    enqueueing to prevent duplicate multi-turn processing loops.
+    Trigger to ensure a job enters the background worker queue.
+    If the job is already PROCESSING or COMPLETED, duplicate execution is blocked.
+    If the job is QUEUED or in an interrupted state, it is added to the in-memory
+    queue so workers can execute it.
     """
     job_record = get_job(job_id)
     if not job_record:
@@ -221,8 +265,8 @@ async def start_job_processing(job_id: str):
 
     current_status = job_record.get("status")
 
-    # Guard: Prevent re-enqueueing if the job is already in the queue, running, or finished
-    if current_status in ["QUEUED", "PROCESSING", "COMPLETED"]:
+    # Guard: Do not re-run if actively working on it or already successfully finished
+    if current_status in ["PROCESSING", "COMPLETED"]:
         logger.info(
             f"[*] Bypassing duplicate queue dispatch for job {job_id} (current status: {current_status})."
         )
@@ -232,14 +276,14 @@ async def start_job_processing(job_id: str):
             "message": f"Job {job_id} is already in state {current_status}; duplicate dispatch skipped."
         }
 
-    # If the job was in a paused or non-enqueued state (e.g. DRAFT or retry), dispatch to queue
+    # Put job into the in-memory queue to guarantee worker picks it up
     await job_queue.put(job_id)
-    logger.info(f"[*] Job {job_id} dispatched to background execution queue.")
+    logger.info(f"[*] Job {job_id} explicitly dispatched to background execution queue.")
 
     return {
         "status": "QUEUED",
         "job_id": job_id,
-        "message": "Job dispatched to background extraction queue."
+        "message": f"Job {job_id} successfully queued for background extraction."
     }
 
 
@@ -250,11 +294,11 @@ async def start_job_processing(job_id: str):
 @router.get(
     "/{job_id}/image/{doc_type}",
     summary="Retrieve captured document image artifact for desktop review",
-    description="Streams the raw image file (passport_bio, visa_page, entry_stamp, welcome_form, or guest_photo) stored on disk for a specific job."
+    description="Streams the raw image file (passport_bio, visa_document, visa_stamp, visa_page, entry_stamp, welcome_form, or guest_photo) stored on disk for a specific job."
 )
 async def get_job_document_image(job_id: str, doc_type: str):
     """
-    Streams the stored binary document image for desktop inspection.
+    Streams the stored binary document image for desktop/mobile inspection.
     First checks SQLite doc_paths manifest, then falls back to directory inspection.
     """
     job_record = get_job(job_id)
@@ -267,7 +311,7 @@ async def get_job_document_image(job_id: str, doc_type: str):
     doc_paths = job_record.get("doc_paths", {})
     resolved_path = doc_paths.get(doc_type)
 
-    # If path in database exists and is valid, return it directly
+    # If path in database exists and is valid on disk, stream it immediately
     if resolved_path and os.path.exists(resolved_path):
         return FileResponse(resolved_path, media_type="image/jpeg")
 
@@ -276,7 +320,9 @@ async def get_job_document_image(job_id: str, doc_type: str):
     if os.path.exists(job_dir):
         prefix_mapping = {
             "passport_bio": ["bio_", "passport_"],
-            "visa_page": ["visa_"],
+            "visa_document": ["visadoc_"],
+            "visa_stamp": ["visastamp_"],
+            "visa_page": ["visa_", "visadoc_", "visastamp_"],
             "entry_stamp": ["stamp_"],
             "welcome_form": ["form_", "welcome_"],
             "guest_photo": ["guest_photo_", "photo_"]
@@ -307,7 +353,8 @@ async def get_job_document_image(job_id: str, doc_type: str):
 async def get_job_status(job_id: str) -> JobDetailResponse:
     """
     Returns current execution state (QUEUED, PROCESSING, COMPLETED, FAILED).
-    When COMPLETED, returns the fused Form-C guest record with field-level confidence ratings.
+    When COMPLETED, returns the fused Form-C guest record with field-level confidence ratings
+    and per-document isolated extraction models.
     """
     job_record = get_job(job_id)
     if not job_record:
@@ -370,3 +417,48 @@ async def list_jobs(limit: int = 50) -> List[JobDetailResponse]:
             )
         )
     return response_items
+
+
+# ==============================================================================
+# Job Deletion Endpoint (Task 44: Mobile-Triggered Deletion)
+# ==============================================================================
+
+@router.delete(
+    "/{job_id}",
+    response_model=JobDeletionResponse,
+    summary="Permanently delete job record and wipe associated image artifacts from disk"
+)
+async def delete_job_and_artifacts(job_id: str) -> JobDeletionResponse:
+    """
+    Permanently purges a submission:
+    1. Removes the job record from SQLite database.
+    2. Deletes the entire disk folder /opt/PassportReadAPI/storage/jobs/{job_id} and all stored images.
+    """
+    job_record = get_job(job_id)
+    if not job_record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job with ID '{job_id}' not found."
+        )
+
+    # 1. Count disk image files before purging
+    purged_files = 0
+    job_dir = os.path.join(BASE_STORAGE_DIR, job_id)
+    if os.path.exists(job_dir):
+        try:
+            purged_files = len([f for f in os.listdir(job_dir) if os.path.isfile(os.path.join(job_dir, f))])
+            shutil.rmtree(job_dir, ignore_errors=True)
+            logger.info(f"[*] Purged disk directory and {purged_files} file(s) for job: {job_id}")
+        except Exception as disk_err:
+            logger.warning(f"[*] Error removing disk files for job {job_id}: {disk_err}")
+
+    # 2. Delete row from SQLite
+    delete_job_record(job_id)
+    logger.info(f"[+] Successfully purged job {job_id} from database and disk storage.")
+
+    return JobDeletionResponse(
+        job_id=job_id,
+        status="DELETED",
+        purged_disk_files=purged_files,
+        message=f"Submission {job_id} and {purged_files} stored image artifact(s) permanently deleted."
+    )
