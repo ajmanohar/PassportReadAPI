@@ -3,20 +3,17 @@
 # ==============================================================================
 # Background batch execution pipeline and serial queue worker for asynchronous Form-C jobs.
 # Processes multi-document bundles sequentially:
-#   Stage 1: Passport Bio-Data (Tesseract MRZ + Qwen2-VL tournament)
-#   Stage 2A: e-Visa Paper / PDF Document Extraction (Qwen2-VL)
-#   Stage 2B: Passport Booklet Consular Visa Stamp Extraction (Qwen2-VL)
-#   Stage 3: Immigration Arrival Rubber Ink Stamp Extraction (Qwen2-VL with multi-angle guard)
+#   Stage 1: Passport Bio-Data (4-Angle MRZ Tournament + Upright Qwen2-VL) [Task 50]
+#   Stage 2A: e-Visa Paper / PDF Document Extraction (Qwen2-VL) [Task 42]
+#   Stage 2B: Passport Booklet Consular Visa Stamp Extraction (Qwen2-VL) [Task 42]
+#   Stage 3: Immigration Arrival Rubber Ink Stamp Extraction (Qwen2-VL with multi-angle guard) [Task 49]
 #   Stage 4: Handwritten Form-C Rule 14 Arrival Report (OCR-grounded full-page Qwen2-VL)
 #
 # Key Architectural Features:
-# - Task 45: Populates isolated per-document data models in fused_record.documents
-#   so raw extractions from one document never overwrite or conflict with another.
-# - Task 42: Differentiates e-Visa Paper Document vs. Passport Booklet Visa Stamp.
-# - Task 49: Precision rectangular rubber stamp detection with 4-angle rotation scan.
+# - Task 45: Populates isolated per-document data models in fused_record.documents.
+# - Task 50: 4-way rotation scan for Passport Bio page to maximize MRZ checksum passing.
 # - Loop/Duplicate Guard: Enforces safe deduplicated queuing and skips re-execution
 #   if a job is already COMPLETED or already queued/active.
-# - Preserves full backward compatibility on top-level fields for existing clients.
 # ==============================================================================
 
 import asyncio
@@ -539,7 +536,7 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
 
     try:
         # ======================================================================
-        # 1. PASSPORT BIO PAGE: DUAL-ENGINE TOURNAMENT (MRZ + VLM)
+        # 1. PASSPORT BIO PAGE: 4-ANGLE MRZ TOURNAMENT + UPRIGHT VLM [TASK 50]
         # ======================================================================
         doc_paths = refresh_document_paths(job_id)
         bio_path = doc_paths.get("passport_bio")
@@ -547,109 +544,141 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
         if bio_path and os.path.exists(bio_path):
             logger.info(f"[{job_id}] Stage 1/4: Dual-engine extraction for passport bio page ({bio_path})...")
 
-            # --- Engine A: Tesseract MRZ ---
+            # Load base image with EXIF orientation baked in
+            base_bio_img = Image.open(bio_path)
+            base_bio_img = ImageOps.exif_transpose(base_bio_img)
+            if base_bio_img.mode != "RGB":
+                base_bio_img = base_bio_img.convert("RGB")
+
+            # --- Engine A: 4-Angle MRZ Scan Tournament (Task 50) ---
             mrz_start = time.perf_counter()
-            mrz_candidates: Dict[str, FieldResult] = {}
+            best_mrz_record = None
+            best_score = -1
+            best_rotation_angle = 0
             valid_mrz_flag = False
 
-            try:
-                with open(bio_path, "rb") as f:
-                    image_bytes = f.read()
+            # Test 0, 90, 180, 270 degrees rotations
+            for test_angle in [0, 90, 180, 270]:
+                rot_img = base_bio_img.rotate(test_angle, expand=True) if test_angle != 0 else base_bio_img
+                buf = io.BytesIO()
+                rot_img.save(buf, format="JPEG", quality=90)
+                buf.seek(0)
 
-                mrz_record = await asyncio.to_thread(read_mrz, io.BytesIO(image_bytes))
+                try:
+                    cand_mrz = await asyncio.to_thread(read_mrz, buf)
+                    if cand_mrz is not None:
+                        cand_score = int(getattr(cand_mrz, "valid_score", 0))
+                        cand_valid_composite = bool(getattr(cand_mrz, "valid_composite", False))
+                        cand_valid_number = bool(getattr(cand_mrz, "valid_number", False))
+                        cand_is_valid = bool(cand_valid_composite or (cand_score >= 80 and cand_valid_number))
 
-                if mrz_record is not None:
-                    mrz_dict = mrz_record.to_dict() if hasattr(mrz_record, "to_dict") else {}
-                    score_val = getattr(mrz_record, "valid_score", 0)
-                    valid_score = int(score_val) if isinstance(score_val, (int, float)) else 0
-                    base_text_conf = round(max(0.0, min(1.0, valid_score / 100.0)), 2)
+                        logger.info(f"[{job_id}] MRZ scan at {test_angle}°: score={cand_score}, valid={cand_is_valid}")
 
-                    check_number = bool(getattr(mrz_record, "valid_number", False))
-                    check_dob = bool(getattr(mrz_record, "valid_date_of_birth", False))
-                    check_exp = bool(getattr(mrz_record, "valid_expiration_date", False))
-                    check_composite = bool(getattr(mrz_record, "valid_composite", False))
+                        if cand_score > best_score:
+                            best_score = cand_score
+                            best_mrz_record = cand_mrz
+                            best_rotation_angle = test_angle
+                            valid_mrz_flag = cand_is_valid
 
-                    valid_mrz_flag = bool(check_composite or (valid_score >= 80 and check_number))
+                        # If 100% valid MRZ checksum obtained, stop searching other angles
+                        if cand_is_valid and cand_score >= 85:
+                            break
+                except Exception as angle_mrz_err:
+                    logger.debug(f"[{job_id}] MRZ angle {test_angle}° error: {angle_mrz_err}")
 
-                    def mk_checked(val: Optional[str], check_passed: bool, is_date: bool = False, is_expiry: bool = False) -> FieldResult:
-                        clean = sanitize_extracted_string(val)
-                        if not clean:
-                            return FieldResult(value=None, confidence=0.0, source="tesseract_mrz")
-                        if is_date:
-                            clean = parse_mrz_date(clean, is_expiry=is_expiry) or clean
+            mrz_candidates: Dict[str, FieldResult] = {}
+            if best_mrz_record is not None:
+                mrz_dict = best_mrz_record.to_dict() if hasattr(best_mrz_record, "to_dict") else {}
+                base_text_conf = round(max(0.0, min(1.0, best_score / 100.0)), 2)
 
-                        return FieldResult(
-                            value=clean,
-                            confidence=0.95 if check_passed else 0.30,
-                            source="tesseract_mrz"
-                        )
+                check_number = bool(getattr(best_mrz_record, "valid_number", False))
+                check_dob = bool(getattr(best_mrz_record, "valid_date_of_birth", False))
+                check_exp = bool(getattr(best_mrz_record, "valid_expiration_date", False))
 
-                    def mk_text(val: Optional[str]) -> FieldResult:
-                        clean = sanitize_extracted_string(val)
-                        if not clean:
-                            return FieldResult(value=None, confidence=0.0, source="tesseract_mrz")
-                        return FieldResult(
-                            value=clean,
-                            confidence=base_text_conf,
-                            source="tesseract_mrz"
-                        )
+                def mk_checked(val: Optional[str], check_passed: bool, is_date: bool = False, is_expiry: bool = False) -> FieldResult:
+                    clean = sanitize_extracted_string(val)
+                    if not clean:
+                        return FieldResult(value=None, confidence=0.0, source="tesseract_mrz")
+                    if is_date:
+                        clean = parse_mrz_date(clean, is_expiry=is_expiry) or clean
 
-                    mrz_candidates["surname"] = mk_text(mrz_dict.get("surname"))
-                    mrz_candidates["given_names"] = mk_text(mrz_dict.get("names"))
-                    mrz_candidates["passport_number"] = mk_checked(mrz_dict.get("number"), check_number)
-                    mrz_candidates["nationality"] = mk_text(mrz_dict.get("nationality"))
-                    mrz_candidates["date_of_birth"] = mk_checked(mrz_dict.get("date_of_birth"), check_dob, is_date=True, is_expiry=False)
-                    mrz_candidates["sex"] = mk_text(mrz_dict.get("sex"))
-                    mrz_candidates["passport_expiry_date"] = mk_checked(mrz_dict.get("expiration_date"), check_exp, is_date=True, is_expiry=True)
-
-                    mrz_duration = time.perf_counter() - mrz_start
-                    logger.info(
-                        f"[{job_id}] Tesseract MRZ completed in {mrz_duration:.2f}s "
-                        f"(valid={valid_mrz_flag}, score={valid_score}, valid_num={check_number})."
+                    return FieldResult(
+                        value=clean,
+                        confidence=0.95 if check_passed else 0.30,
+                        source="tesseract_mrz"
                     )
-                    processing_notes.append(f"MRZ parsed in {mrz_duration:.2f}s (valid: {valid_mrz_flag}, score: {valid_score}).")
-                else:
-                    mrz_duration = time.perf_counter() - mrz_start
-                    logger.info(f"[{job_id}] Tesseract MRZ found no patterns ({mrz_duration:.2f}s).")
-                    processing_notes.append(f"MRZ not detected ({mrz_duration:.2f}s).")
-            except Exception as mrz_exc:
-                logger.warning(f"[{job_id}] MRZ extraction error: {str(mrz_exc)}", exc_info=True)
-                processing_notes.append(f"MRZ error: {str(mrz_exc)}")
 
-            # --- Engine B: Qwen2-VL Visual Bio ---
-            vlm_candidates: Dict[str, FieldResult] = {}
-            bio_image = await asyncio.to_thread(load_and_preprocess_image, bio_path)
+                def mk_text(val: Optional[str]) -> FieldResult:
+                    clean = sanitize_extracted_string(val)
+                    if not clean:
+                        return FieldResult(value=None, confidence=0.0, source="tesseract_mrz")
+                    return FieldResult(
+                        value=clean,
+                        confidence=base_text_conf,
+                        source="tesseract_mrz"
+                    )
 
-            if bio_image:
-                bio_prompt = (
-                    "You are an administrative document verification assistant reading a passport bio page image.\n"
-                    "Extract the printed text into a valid JSON object matching this schema:\n"
-                    "{\n"
-                    '  "surname": {"value": string or null, "confidence": float},\n'
-                    '  "given_names": {"value": string or null, "confidence": float},\n'
-                    '  "passport_number": {"value": string or null, "confidence": float},\n'
-                    '  "nationality": {"value": string or null, "confidence": float},\n'
-                    '  "date_of_birth": {"value": string or null, "confidence": float},\n'
-                    '  "sex": {"value": "M" or "F" or null, "confidence": float},\n'
-                    '  "expiry_date": {"value": string or null, "confidence": float}\n'
-                    "}\n"
-                    "Instructions:\n"
-                    "- Transcribe only text clearly legible on this document.\n"
-                    "- For passport_number, transcribe the exact alphanumeric string printed in the Visual Inspection Zone (e.g. C9K82159L).\n"
-                    "- If any field is missing or unreadable, return null for value and 0.0 for confidence.\n"
-                    "- Output JSON only."
+                mrz_candidates["surname"] = mk_text(mrz_dict.get("surname"))
+                mrz_candidates["given_names"] = mk_text(mrz_dict.get("names"))
+                mrz_candidates["passport_number"] = mk_checked(mrz_dict.get("number"), check_number)
+                mrz_candidates["nationality"] = mk_text(mrz_dict.get("nationality"))
+                mrz_candidates["date_of_birth"] = mk_checked(mrz_dict.get("date_of_birth"), check_dob, is_date=True, is_expiry=False)
+                mrz_candidates["sex"] = mk_text(mrz_dict.get("sex"))
+                mrz_candidates["passport_expiry_date"] = mk_checked(mrz_dict.get("expiration_date"), check_exp, is_date=True, is_expiry=True)
+
+                mrz_duration = time.perf_counter() - mrz_start
+                logger.info(
+                    f"[{job_id}] Tesseract MRZ completed in {mrz_duration:.2f}s "
+                    f"(winning angle={best_rotation_angle}°, valid={valid_mrz_flag}, score={best_score})."
                 )
-                vlm_bio = await asyncio.to_thread(run_vlm_inference, bio_image, bio_prompt, ml_state, "Passport Bio VLM")
+                processing_notes.append(f"MRZ parsed at {best_rotation_angle}° in {mrz_duration:.2f}s (valid: {valid_mrz_flag}, score: {best_score}).")
+            else:
+                mrz_duration = time.perf_counter() - mrz_start
+                logger.info(f"[{job_id}] Tesseract MRZ found no patterns across 4 angles ({mrz_duration:.2f}s).")
+                processing_notes.append(f"MRZ not detected across 4 rotations ({mrz_duration:.2f}s).")
 
-                vlm_candidates["surname"] = normalize_vlm_field(vlm_bio.get("surname"))
-                vlm_candidates["given_names"] = normalize_vlm_field(vlm_bio.get("given_names"))
-                vlm_candidates["passport_number"] = normalize_vlm_field(vlm_bio.get("passport_number"))
-                vlm_candidates["nationality"] = normalize_vlm_field(vlm_bio.get("nationality"))
-                vlm_candidates["date_of_birth"] = normalize_vlm_field(vlm_bio.get("date_of_birth"))
-                vlm_candidates["sex"] = normalize_vlm_field(vlm_bio.get("sex"))
-                vlm_candidates["passport_expiry_date"] = normalize_vlm_field(vlm_bio.get("expiry_date"))
+            # --- Engine B: Qwen2-VL Visual Bio on Upright Image (Task 50) ---
+            # Rotate bio image to match winning MRZ angle so Qwen2-VL receives upright image
+            if best_rotation_angle != 0:
+                logger.info(f"[{job_id}] Aligning bio image to winning angle {best_rotation_angle}° for VLM inference.")
+                bio_image = base_bio_img.rotate(best_rotation_angle, expand=True)
+            else:
+                bio_image = base_bio_img
 
-                processing_notes.append("Qwen2-VL visual bio extraction completed.")
+            # Scale to max dimension if needed
+            if max(bio_image.size) > settings.max_image_dimension:
+                bio_image.thumbnail((settings.max_image_dimension, settings.max_image_dimension), Image.Resampling.LANCZOS)
+
+            vlm_candidates: Dict[str, FieldResult] = {}
+            bio_prompt = (
+                "You are an administrative document verification assistant reading a passport bio page image.\n"
+                "Extract the printed text into a valid JSON object matching this schema:\n"
+                "{\n"
+                '  "surname": {"value": string or null, "confidence": float},\n'
+                '  "given_names": {"value": string or null, "confidence": float},\n'
+                '  "passport_number": {"value": string or null, "confidence": float},\n'
+                '  "nationality": {"value": string or null, "confidence": float},\n'
+                '  "date_of_birth": {"value": string or null, "confidence": float},\n'
+                '  "sex": {"value": "M" or "F" or null, "confidence": float},\n'
+                '  "expiry_date": {"value": string or null, "confidence": float}\n'
+                "}\n"
+                "Instructions:\n"
+                "- Transcribe only text clearly legible on this document.\n"
+                "- For passport_number, transcribe the exact alphanumeric string printed in the Visual Inspection Zone (e.g. C9K82159L).\n"
+                "- If any field is missing or unreadable, return null for value and 0.0 for confidence.\n"
+                "- Output JSON only."
+            )
+            vlm_bio = await asyncio.to_thread(run_vlm_inference, bio_image, bio_prompt, ml_state, "Passport Bio VLM")
+
+            vlm_candidates["surname"] = normalize_vlm_field(vlm_bio.get("surname"))
+            vlm_candidates["given_names"] = normalize_vlm_field(vlm_bio.get("given_names"))
+            vlm_candidates["passport_number"] = normalize_vlm_field(vlm_bio.get("passport_number"))
+            vlm_candidates["nationality"] = normalize_vlm_field(vlm_bio.get("nationality"))
+            vlm_candidates["date_of_birth"] = normalize_vlm_field(vlm_bio.get("date_of_birth"))
+            vlm_candidates["sex"] = normalize_vlm_field(vlm_bio.get("sex"))
+            vlm_candidates["passport_expiry_date"] = normalize_vlm_field(vlm_bio.get("expiry_date"))
+
+            processing_notes.append("Qwen2-VL visual bio extraction completed.")
 
             # --- Tournament Selection ---
             empty_field = FieldResult(value=None, confidence=0.0, source="none")
@@ -827,7 +856,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
             stamp_image = await asyncio.to_thread(load_and_preprocess_image, stamp_path)
             
             if stamp_image:
-                # Task 49: Enhanced 4-angle rotation detection for rectangular / ink stamps
                 best_stamp_angle = 0
                 stamp_keywords = [
                     "IMMIGRATION", "ARRIVAL", "ARRIVED", "ENTRY", "INDIA",
@@ -838,7 +866,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                 try:
                     thumb_stamp = stamp_image.copy()
                     thumb_stamp.thumbnail((800, 800), Image.Resampling.LANCZOS)
-                    # Enhance contrast on thumbnail for faint ink reading
                     enhancer = ImageEnhance.Contrast(thumb_stamp)
                     thumb_enhanced = enhancer.enhance(1.8)
                     
@@ -865,7 +892,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                 except Exception as stamp_orient_err:
                     logger.warning(f"[{job_id}] Stamp orientation detection bypassed: {stamp_orient_err}")
 
-                # Task 49: Guiding prompt specifically for rectangular & oval Indian immigration stamps
                 stamp_prompt = (
                     "You are an administrative document verification assistant inspecting a passport page for an Indian immigration entry stamp.\n"
                     "INSTRUCTIONS ON STAMP STRUCTURE:\n"
