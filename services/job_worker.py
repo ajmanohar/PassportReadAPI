@@ -13,7 +13,8 @@
 # - Task 45: Populates isolated per-document data models in fused_record.documents
 #   so raw extractions from one document never overwrite or conflict with another.
 # - Task 42: Differentiates e-Visa Paper Document vs. Passport Booklet Visa Stamp.
-# - Offline Enforcement: Uses local_files_only to prevent Hugging Face Hub phone-home checks.
+# - Loop/Duplicate Guard: Enforces safe deduplicated queuing and skips re-execution
+#   if a job is already COMPLETED or already queued/active.
 # - Preserves full backward compatibility on top-level fields for existing clients.
 # ==============================================================================
 
@@ -25,7 +26,7 @@ import os
 import re
 import time
 from datetime import datetime
-from typing import Dict, Any, Optional, List, Union
+from typing import Dict, Any, Optional, List, Union, Set
 
 from PIL import Image, ImageOps
 import pytesseract
@@ -53,6 +54,9 @@ logger.setLevel(logging.INFO)
 # Global in-memory queue holding job tracking identifiers for sequential execution by the worker loop
 job_queue: asyncio.Queue = asyncio.Queue()
 
+# In-memory tracking set to guard against duplicate queuing while a job is pending or active
+enqueued_or_active_jobs: Set[str] = set()
+
 # Base disk directory for persisting uploaded document images during asynchronous processing
 BASE_STORAGE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "storage", "jobs")
 
@@ -70,6 +74,45 @@ FORBIDDEN_HALLUCINATIONS: List[str] = [
     "lorem ipsum",
     "john.doe"
 ]
+
+
+# ==============================================================================
+# Safe Deduplicated Queue Dispatcher
+# ==============================================================================
+
+async def safe_enqueue_job(job_id: str) -> bool:
+    """
+    Safely enqueues a job tracking ID into the execution queue while preventing
+    duplicate dispatches or re-runs of already completed jobs.
+
+    :param job_id: Unique UUID string for the job.
+    :return: True if the job was newly enqueued; False if rejected as duplicate/completed.
+    """
+    clean_id = str(job_id).strip()
+    if not clean_id:
+        return False
+
+    # 1. Guard against duplicate in-flight dispatch
+    if clean_id in enqueued_or_active_jobs:
+        logger.info(f"[*] Job {clean_id} is already enqueued or actively processing. Duplicate dispatch bypassed.")
+        return False
+
+    # 2. Check current status in SQLite database
+    job_record = get_job(clean_id)
+    if job_record:
+        current_status = job_record.get("status")
+        if current_status == "COMPLETED":
+            logger.info(f"[*] Job {clean_id} is already COMPLETED in database. Duplicate dispatch bypassed.")
+            return False
+        if current_status == "PROCESSING":
+            logger.info(f"[*] Job {clean_id} is currently PROCESSING. Duplicate dispatch bypassed.")
+            return False
+
+    # 3. Mark as tracked and place into queue
+    enqueued_or_active_jobs.add(clean_id)
+    await job_queue.put(clean_id)
+    logger.info(f"[*] Job {clean_id} successfully added to background execution queue (queue size: {job_queue.qsize()}).")
+    return True
 
 
 # ==============================================================================
@@ -117,7 +160,6 @@ def parse_mrz_date(raw_mrz_date: Optional[str], is_expiry: bool = False) -> Opti
         mm = int(cleaned[2:4])
         dd = int(cleaned[4:6])
 
-        # Validate calendar boundaries
         if mm < 1 or mm > 12 or dd < 1 or dd > 31:
             return cleaned
 
@@ -257,7 +299,6 @@ def run_vlm_inference(
     # Explicitly pin PyTorch compute threads to physical CPU cores
     torch.set_num_threads(settings.torch_cpu_threads)
 
-    # Resolve visual patch boundaries dynamically
     effective_min_pixels = min_pixels_override if min_pixels_override is not None else settings.min_pixels
     effective_max_pixels = max_pixels_override if max_pixels_override is not None else settings.max_pixels
 
@@ -481,6 +522,13 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
         logger.error("[!] Dispatched empty or invalid job identifier to process_single_job.")
         return
 
+    # Guard against duplicate execution: if already completed, bypass immediately
+    job_record = get_job(job_id)
+    if job_record and job_record.get("status") == "COMPLETED":
+        logger.info(f"[*] Job {job_id} is already COMPLETED. Skipping duplicate queue execution.")
+        enqueued_or_active_jobs.discard(job_id)
+        return
+
     job_start_time = time.perf_counter()
     logger.info(f"[*] Starting extraction pipeline for job: {job_id}")
     update_job_status(job_id, "PROCESSING")
@@ -516,7 +564,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     valid_score = int(score_val) if isinstance(score_val, (int, float)) else 0
                     base_text_conf = round(max(0.0, min(1.0, valid_score / 100.0)), 2)
 
-                    # Inspect genuine boolean validity attributes computed by passporteye checksum routines
                     check_number = bool(getattr(mrz_record, "valid_number", False))
                     check_dob = bool(getattr(mrz_record, "valid_date_of_birth", False))
                     check_exp = bool(getattr(mrz_record, "valid_expiration_date", False))
@@ -528,8 +575,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                         clean = sanitize_extracted_string(val)
                         if not clean:
                             return FieldResult(value=None, confidence=0.0, source="tesseract_mrz")
-                        
-                        # Normalize 6-digit MRZ date representation (YYMMDD) to standard YYYY-MM-DD
                         if is_date:
                             clean = parse_mrz_date(clean, is_expiry=is_expiry) or clean
 
@@ -676,7 +721,7 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
         # 2A. VISA DOCUMENT (E-VISA PAPER / PDF PRINT) - TASK 42
         # ======================================================================
         doc_paths = refresh_document_paths(job_id)
-        visa_doc_path = doc_paths.get("visa_document") or (doc_paths.get("visa_page") if "visa_stamp" in doc_paths else None)
+        visa_doc_path = doc_paths.get("visa_document")
 
         if visa_doc_path and os.path.exists(visa_doc_path):
             logger.info(f"[{job_id}] Stage 2A: Running Qwen2-VL e-Visa document extraction ({visa_doc_path})...")
@@ -702,7 +747,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                 )
                 vlm_vdoc = await asyncio.to_thread(run_vlm_inference, vdoc_image, vdoc_prompt, ml_state, "Visa Document VLM")
                 
-                # Isolated container for Visa Document
                 fused_record.documents.visa_document = VisaDocumentRecord(
                     visa_number=normalize_vlm_field(vlm_vdoc.get("visa_number"), source="visa_document"),
                     visa_type=normalize_vlm_field(vlm_vdoc.get("visa_type"), source="visa_document"),
@@ -711,7 +755,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     visa_place_of_issue=normalize_vlm_field(vlm_vdoc.get("place_of_issue"), source="visa_document")
                 )
                 
-                # Populate top-level fields for backwards compatibility
                 fused_record.visa_number = fused_record.documents.visa_document.visa_number
                 fused_record.visa_type = fused_record.documents.visa_document.visa_type
                 fused_record.visa_issue_date = fused_record.documents.visa_document.visa_issue_date
@@ -727,7 +770,7 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
         # 2B. VISA STAMP (PASSPORT BOOKLET CONSULAR STICKER/STAMP) - TASK 42
         # ======================================================================
         doc_paths = refresh_document_paths(job_id)
-        visa_stamp_path = doc_paths.get("visa_stamp") or (doc_paths.get("visa_page") if "visa_document" not in doc_paths else None)
+        visa_stamp_path = doc_paths.get("visa_stamp") or doc_paths.get("visa_page")
 
         if visa_stamp_path and os.path.exists(visa_stamp_path):
             logger.info(f"[{job_id}] Stage 2B: Running Qwen2-VL passport booklet visa stamp extraction ({visa_stamp_path})...")
@@ -753,7 +796,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                 )
                 vlm_vstamp = await asyncio.to_thread(run_vlm_inference, vstamp_image, vstamp_prompt, ml_state, "Visa Stamp VLM")
                 
-                # Isolated container for Visa Stamp
                 fused_record.documents.visa_stamp = VisaStampRecord(
                     visa_number=normalize_vlm_field(vlm_vstamp.get("visa_number"), source="visa_stamp"),
                     visa_type=normalize_vlm_field(vlm_vstamp.get("visa_type"), source="visa_stamp"),
@@ -762,7 +804,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     visa_place_of_issue=normalize_vlm_field(vlm_vstamp.get("place_of_issue"), source="visa_stamp")
                 )
                 
-                # If top-level visa_number was not populated by a visa_document, populate with stamp
                 if not fused_record.visa_number.value:
                     fused_record.visa_number = fused_record.documents.visa_stamp.visa_number
                     fused_record.visa_type = fused_record.documents.visa_stamp.visa_type
@@ -786,7 +827,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
             stamp_image = await asyncio.to_thread(load_and_preprocess_image, stamp_path)
             
             if stamp_image:
-                # Orientation Guard: Checks specifically for stamp ink keywords
                 best_stamp_angle = 0
                 try:
                     thumb_stamp = stamp_image.copy()
@@ -831,13 +871,11 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                 )
                 vlm_stamp = await asyncio.to_thread(run_vlm_inference, stamp_image, stamp_prompt, ml_state, "Stamp VLM")
                 
-                # Isolated container for Entry Stamp
                 fused_record.documents.entry_stamp = EntryStampRecord(
                     arrival_date_india=normalize_vlm_field(vlm_stamp.get("arrival_date"), source="entry_stamp"),
                     arrival_port_india=normalize_vlm_field(vlm_stamp.get("arrival_port"), source="entry_stamp")
                 )
                 
-                # Populate top-level fields for backwards compatibility
                 fused_record.arrival_date_india = fused_record.documents.entry_stamp.arrival_date_india
                 fused_record.arrival_port_india = fused_record.documents.entry_stamp.arrival_port_india
                 
@@ -859,7 +897,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
             welcome_raw = await asyncio.to_thread(load_and_preprocess_image, welcome_path)
             
             if welcome_raw:
-                # 180° Inversion Guard for Form-C
                 try:
                     sample_thumb = welcome_raw.copy()
                     sample_thumb.thumbnail((800, 800))
@@ -888,13 +925,12 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                 img_w, img_h = welcome_raw.size
                 logger.info(f"[{job_id}] Running unified full-document extraction on Form-C ({img_w}x{img_h})...")
 
-                # Local OCR character tokens for grounding hints
                 ocr_full_text = ""
                 try:
                     ocr_full_raw = await asyncio.to_thread(pytesseract.image_to_string, welcome_raw)
                     ocr_full_lines = [line.strip() for line in ocr_full_raw.splitlines() if line.strip()]
                     ocr_full_text = "\n".join(ocr_full_lines)
-                except Exception as e:
+                except Exception:
                     ocr_full_text = "No OCR hints available."
 
                 welcome_full_prompt = (
@@ -954,7 +990,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     262144
                 )
 
-                # Isolated container for Form-C (Task 45)
                 fused_record.documents.welcome_form = FormCReportRecord(
                     name_of_foreigner=normalize_vlm_field(vlm_form.get("name_of_foreigner"), source="welcome_form"),
                     permanent_address=normalize_vlm_field(vlm_form.get("full_address"), source="welcome_form"),
@@ -977,14 +1012,12 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     arrived_country_city_india=normalize_vlm_field(vlm_form.get("country_city_arrived_to_india"), source="welcome_form")
                 )
 
-                # Populate composite top-level fields
                 fused_record.permanent_address = fused_record.documents.welcome_form.permanent_address
                 fused_record.city = fused_record.documents.welcome_form.city
                 fused_record.country = fused_record.documents.welcome_form.country
                 fused_record.contact_email = fused_record.documents.welcome_form.contact_email
                 fused_record.contact_phone = fused_record.documents.welcome_form.contact_phone
 
-                # Fallback guest name from Form-C only if bio scan was unextracted
                 form_c_name = fused_record.documents.welcome_form.name_of_foreigner
                 if form_c_name.value and (not fused_record.given_names.value and not fused_record.surname.value):
                     parts = form_c_name.value.split(maxsplit=1)
@@ -992,7 +1025,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     if len(parts) > 1:
                         fused_record.given_names = FieldResult(value=parts[1], confidence=form_c_name.confidence, source="welcome_form")
 
-                # Fallback bio comparisons only if primary documents were missing
                 if not fused_record.visa_place_of_issue.value:
                     fused_record.visa_place_of_issue = fused_record.documents.welcome_form.place_of_issue_of_visa
                 if not fused_record.arrival_date_india.value:
@@ -1000,7 +1032,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                 if not fused_record.nationality.value:
                     fused_record.nationality = fused_record.documents.welcome_form.nationality
 
-                # Homestay & travel movement fields
                 fused_record.arrival_datetime_homestay = fused_record.documents.welcome_form.arrival_datetime_homestay
                 fused_record.arrived_from = fused_record.documents.welcome_form.arrived_from
                 fused_record.proceeding_to = fused_record.documents.welcome_form.proceeding_to
@@ -1013,12 +1044,10 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
         else:
             logger.info(f"[{job_id}] Stage 4/4: No welcome_form document attached to job. Skipping.")
 
-        # Persist final fused record with diagnostic tournament logs and total elapsed duration
         total_job_duration = time.perf_counter() - job_start_time
         processing_notes.append(f"Complete pipeline executed in {total_job_duration:.2f}s.")
         fused_record.processing_notes = processing_notes
 
-        # Transition status to COMPLETED and commit final result
         save_job_result(job_id, fused_record.model_dump())
         logger.info(f"[+] Job {job_id} successfully completed in {total_job_duration:.2f}s.")
 
@@ -1026,6 +1055,9 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
         total_job_duration = time.perf_counter() - job_start_time
         logger.error(f"[!] Pipeline processing aborted for job {job_id} after {total_job_duration:.2f}s: {str(exc)}", exc_info=True)
         update_job_status(job_id, "FAILED", error_message=f"{str(exc)} (after {total_job_duration:.2f}s)")
+    finally:
+        # Always remove from active tracking set once execution finishes
+        enqueued_or_active_jobs.discard(job_id)
 
 
 # ==============================================================================
@@ -1045,7 +1077,6 @@ async def background_queue_worker(ml_state: dict) -> None:
         try:
             job_item = await job_queue.get()
             
-            # Defensive unwrap: Extract job_id whether item is a string or dictionary
             if isinstance(job_item, dict):
                 job_id = str(job_item.get("job_id", "")).strip()
             else:
