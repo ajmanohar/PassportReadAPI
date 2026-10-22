@@ -6,13 +6,14 @@
 #   Stage 1: Passport Bio-Data (Tesseract MRZ + Qwen2-VL tournament)
 #   Stage 2A: e-Visa Paper / PDF Document Extraction (Qwen2-VL)
 #   Stage 2B: Passport Booklet Consular Visa Stamp Extraction (Qwen2-VL)
-#   Stage 3: Immigration Arrival Rubber Ink Stamp Extraction (Qwen2-VL)
+#   Stage 3: Immigration Arrival Rubber Ink Stamp Extraction (Qwen2-VL with multi-angle guard)
 #   Stage 4: Handwritten Form-C Rule 14 Arrival Report (OCR-grounded full-page Qwen2-VL)
 #
 # Key Architectural Features:
 # - Task 45: Populates isolated per-document data models in fused_record.documents
 #   so raw extractions from one document never overwrite or conflict with another.
 # - Task 42: Differentiates e-Visa Paper Document vs. Passport Booklet Visa Stamp.
+# - Task 49: Precision rectangular rubber stamp detection with 4-angle rotation scan.
 # - Loop/Duplicate Guard: Enforces safe deduplicated queuing and skips re-execution
 #   if a job is already COMPLETED or already queued/active.
 # - Preserves full backward compatibility on top-level fields for existing clients.
@@ -28,7 +29,7 @@ import time
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Union, Set
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageEnhance
 import pytesseract
 import torch
 from passporteye import read_mrz
@@ -209,7 +210,7 @@ def load_and_preprocess_image(
         # 1. Standardize orientation using EXIF orientation tags (if present)
         image = ImageOps.exif_transpose(raw_img)
 
-        # 2. Standardize color profile to 3-channel RGB (eliminates alpha channel or CMYK artifacts)
+        # 2. Standardize color profile to 3-channel RGB
         if image.mode != "RGB":
             image = image.convert("RGB")
 
@@ -228,7 +229,6 @@ def load_and_preprocess_image(
                     f"rotate={rotate_angle}°, conf={osd_conf:.2f}, script={osd_script}"
                 )
 
-                # High-confidence threshold guardrail
                 if rotate_angle in [90, 180, 270] and osd_conf >= 2.0 and osd_script == "Latin":
                     logger.info(f"[ImageLoader] High-confidence OSD detected {rotate_angle}° rotation. Correcting '{os.path.basename(file_path)}'...")
                     image = image.rotate(360 - rotate_angle, expand=True)
@@ -817,7 +817,7 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                 logger.info(f"[{job_id}] Stage 2B completed and intermediate state persisted to database.")
 
         # ======================================================================
-        # 3. IMMIGRATION ENTRY STAMP EXTRACTION (QWEN2-VL)
+        # 3. IMMIGRATION ENTRY STAMP EXTRACTION (TASK 49: MULTI-ANGLE GUARD)
         # ======================================================================
         doc_paths = refresh_document_paths(job_id)
         stamp_path = doc_paths.get("entry_stamp")
@@ -827,49 +827,76 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
             stamp_image = await asyncio.to_thread(load_and_preprocess_image, stamp_path)
             
             if stamp_image:
+                # Task 49: Enhanced 4-angle rotation detection for rectangular / ink stamps
                 best_stamp_angle = 0
+                stamp_keywords = [
+                    "IMMIGRATION", "ARRIVAL", "ARRIVED", "ENTRY", "INDIA",
+                    "COCHIN", "MUMBAI", "DELHI", "BANGALORE", "CHENNAI",
+                    "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"
+                ]
+
                 try:
                     thumb_stamp = stamp_image.copy()
                     thumb_stamp.thumbnail((800, 800), Image.Resampling.LANCZOS)
+                    # Enhance contrast on thumbnail for faint ink reading
+                    enhancer = ImageEnhance.Contrast(thumb_stamp)
+                    thumb_enhanced = enhancer.enhance(1.8)
                     
                     found_angle = None
+                    max_matches = 0
+                    
                     for test_angle in [0, 90, 180, 270]:
-                        rotated_thumb = thumb_stamp.rotate(test_angle, expand=True) if test_angle != 0 else thumb_stamp
+                        rotated_thumb = thumb_enhanced.rotate(test_angle, expand=True) if test_angle != 0 else thumb_enhanced
                         ocr_txt = await asyncio.to_thread(pytesseract.image_to_string, rotated_thumb)
                         ocr_upper = ocr_txt.upper()
                         
-                        if any(kw in ocr_upper for kw in ["IMMIGRATION", "ARRIVAL", "ENTRY"]):
+                        match_count = sum(1 for kw in stamp_keywords if kw in ocr_upper)
+                        if match_count > max_matches:
+                            max_matches = match_count
                             found_angle = test_angle
-                            logger.info(f"[{job_id}] Entry stamp rubber ink matched anchor at {test_angle}° rotation.")
-                            break
-                    
-                    if found_angle is not None and found_angle != 0:
+
+                    if found_angle is not None and max_matches >= 1:
                         best_stamp_angle = found_angle
-                        logger.info(f"[{job_id}] Rotating stamp image by {best_stamp_angle}° for upright stamp alignment.")
-                        stamp_image = stamp_image.rotate(best_stamp_angle, expand=True)
+                        logger.info(f"[{job_id}] Rectangular entry stamp ink matched {max_matches} keywords at {best_stamp_angle}° rotation.")
+                        if best_stamp_angle != 0:
+                            stamp_image = stamp_image.rotate(best_stamp_angle, expand=True)
                     else:
                         logger.info(f"[{job_id}] Stamp orientation check retained native 0°.")
                 except Exception as stamp_orient_err:
                     logger.warning(f"[{job_id}] Stamp orientation detection bypassed: {stamp_orient_err}")
 
+                # Task 49: Guiding prompt specifically for rectangular & oval Indian immigration stamps
                 stamp_prompt = (
-                    "You are an administrative document verification assistant inspecting a passport page.\n"
-                    "CRITICAL: The page may contain printed passport booklet text (such as country names, 'Visas', or page numbers). IGNORE all printed booklet text completely.\n"
-                    "Focus ONLY on the physical colored rubber ink arrival/entry stamp impressed on the page (usually rectangular or oval with an Indian immigration header, an airport/seaport code, and a stamped date).\n"
+                    "You are an administrative document verification assistant inspecting a passport page for an Indian immigration entry stamp.\n"
+                    "INSTRUCTIONS ON STAMP STRUCTURE:\n"
+                    "- The stamp is typically a RECTANGULAR, OVAL, or SQUARE colored ink impression (blue, green, purple, or black ink).\n"
+                    "- Look for the rectangular border containing text such as 'INDIAN IMMIGRATION', 'BUREAU OF IMMIGRATION', or 'ARRIVAL'.\n"
+                    "- Top / Outer border: Contains 'INDIAN IMMIGRATION' or 'INDIA'.\n"
+                    "- Center of stamp: Contains the stamped date (e.g. '14 OCT 2024', '14-10-2024', '07/07/20', or '26 JUL 2020').\n"
+                    "- Bottom border: Contains the port or airport name, e.g. 'COCHIN AIRPORT', 'MUMBAI AIRPORT', 'DELHI', 'CHENNAI AIRPORT'.\n\n"
+                    "CRITICAL: Ignore other visas or printed passport booklet text. Focus strictly on the stamped colored ink arrival box.\n\n"
                     "Extract the arrival details into a valid JSON object matching this schema:\n"
                     "{\n"
-                    '  "arrival_date": {"value": string or null, "confidence": float},\n'
+                    '  "arrival_date": {"value": "YYYY-MM-DD" or string or null, "confidence": float},\n'
                     '  "arrival_port": {"value": string or null, "confidence": float}\n'
                     "}\n"
-                    "Instructions:\n"
-                    "- Read only ARRIVAL or ENTRY stamps. Ignore departure or exit stamps.\n"
-                    "- For arrival_port, transcribe ONLY the exact airport or seaport name physically printed or stamped on the rubber stamp border. "
-                    "If cut off, smudged, or illegible, return null for value and 0.0 for confidence. DO NOT guess, invent, or assume any city or port names.\n"
-                    "- For arrival_date, transcribe the genuine date printed or stamped across the center of the arrival stamp.\n"
-                    "- If cut off, smudged, or illegible, return null for value and 0.0 for confidence.\n"
+                    "Notes:\n"
+                    "- If date is readable in format DD-MM-YYYY, DD/MM/YY, or DD MMM YYYY, normalize to standard date string.\n"
+                    "- If port of entry name is visible on the stamp, extract it with high confidence (e.g. 'COCHIN AIRPORT').\n"
+                    "- If unreadable or missing, return null for value and 0.0 for confidence.\n"
                     "- Output JSON only."
                 )
-                vlm_stamp = await asyncio.to_thread(run_vlm_inference, stamp_image, stamp_prompt, ml_state, "Stamp VLM")
+
+                vlm_stamp = await asyncio.to_thread(
+                    run_vlm_inference,
+                    stamp_image,
+                    stamp_prompt,
+                    ml_state,
+                    "Stamp VLM (Rectangular Guard)",
+                    256,
+                    38416,
+                    150528
+                )
                 
                 fused_record.documents.entry_stamp = EntryStampRecord(
                     arrival_date_india=normalize_vlm_field(vlm_stamp.get("arrival_date"), source="entry_stamp"),
@@ -1056,7 +1083,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
         logger.error(f"[!] Pipeline processing aborted for job {job_id} after {total_job_duration:.2f}s: {str(exc)}", exc_info=True)
         update_job_status(job_id, "FAILED", error_message=f"{str(exc)} (after {total_job_duration:.2f}s)")
     finally:
-        # Always remove from active tracking set once execution finishes
         enqueued_or_active_jobs.discard(job_id)
 
 
