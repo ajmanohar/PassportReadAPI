@@ -9,14 +9,14 @@
 # Server-Side Document Normalization:
 # - Applies EXIF transposition to correct camera orientation tags.
 # - High-confidence OSD thresholding: Ignores low-confidence (< 2.0) or non-Latin OSD false positives.
-# - Stamp 4-Way Orientation Guard: Evaluates 0°, 90°, 180°, 270° rotations to keep passport stamps upright.
+# - Stamp 4-Way Orientation Guard: Evaluates 0°, 90°, 180°, 270° rotations specifically for
+#   immigration stamp markings ('IMMIGRATION', 'ARRIVAL', 'ENTRY') while ignoring passport book footers.
 # - Form-C Deterministic Orientation: Checks for 'ARRIVAL REPORT' or 'FORM C' in top crop;
-#   if absent, tests 180° flip and rotates to guarantee upright Pass 4A/4B cropping.
-# - Explicit header separation: Distinguishes pre-printed homestay letterhead from guest residential address.
-# - Dynamic visual token bounding respecting per-stage patch ceilings.
-# - High-definition visual patch allocation for fine cursive handwriting.
-# - OCR-Assisted Grounding: Supplies full localized Tesseract tokens as context hints to Qwen2-VL.
-# - Row-Anchored Form-C Slices: Anchors rows 1-5 (Pass 4A: 0-60%) and rows 6-12 (Pass 4B: 55-100%).
+#   if absent, tests 180° flip and rotates to guarantee upright document presentation.
+# - Single Full-Document Form-C Extraction: Processes Rows 1-12 in one unified visual pass
+#   with 262k visual patch allocation and OCR token grounding, eliminating crop seam errors.
+# - Anti-Hallucination Guardrails: Prevents pre-printed homestay letterhead ('Kochi') from
+#   overriding the guest's foreign residential address.
 # - Resilient Queue Ingestion: Safely handles both raw UUID strings and startup recovery dicts.
 # ==============================================================================
 
@@ -689,21 +689,21 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
             logger.info(f"[{job_id}] Stage 2/4: No visa_page document attached to job. Skipping.")
 
         # ======================================================================
-        # 3. IMMIGRATION ENTRY STAMP EXTRACTION (QWEN2-VL + 4-WAY ROTATION GUARD)
+        # 3. IMMIGRATION ENTRY STAMP EXTRACTION (QWEN2-VL)
         # ======================================================================
         doc_paths = refresh_document_paths(job_id)
         stamp_path = doc_paths.get("entry_stamp")
 
         if stamp_path and os.path.exists(stamp_path):
-            logger.info(f"[{job_id}] Stage 3/4: Initializing Entry Stamp extraction with 4-way orientation guard ({stamp_path})...")
+            logger.info(f"[{job_id}] Stage 3/4: Initializing Entry Stamp extraction ({stamp_path})...")
             stamp_image = await asyncio.to_thread(load_and_preprocess_image, stamp_path)
             
             if stamp_image:
                 # --------------------------------------------------------------
-                # Precision 4-Way Inversion & Orientation Guard for Passport Stamps:
-                # Stamps on interior visa pages are often captured landscape (90°/270°)
-                # or inverted (180°). Test low-res thumbnails across all 4 quadrants
-                # for immigration anchors ('IMMIGRATION', 'VISAS', 'ARRIVAL', 'AIRPORT', 'SEAPORT').
+                # Orientation Guard for Entry Stamp:
+                # Tests 0°, 270°, 90°, 180° rotations specifically looking for
+                # immigration stamp anchor keywords ('IMMIGRATION', 'ARRIVAL', 'ENTRY')
+                # while ignoring passport booklet headers/footers ('Visas', 'Sichtvermerke').
                 # --------------------------------------------------------------
                 best_stamp_angle = 0
                 try:
@@ -711,29 +711,30 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     thumb_stamp.thumbnail((800, 800), Image.Resampling.LANCZOS)
                     
                     found_angle = None
-                    # Test native first, then 270°, 90°, 180°
-                    for test_angle in [0, 270, 90, 180]:
+                    for test_angle in [0, 90, 180, 270]:
                         rotated_thumb = thumb_stamp.rotate(test_angle, expand=True) if test_angle != 0 else thumb_stamp
                         ocr_txt = await asyncio.to_thread(pytesseract.image_to_string, rotated_thumb)
                         ocr_upper = ocr_txt.upper()
                         
-                        # Check for passport page or stamp keyword anchors
-                        if any(kw in ocr_upper for kw in ["IMMIGRATION", "VISAS", "SICHTVERMERKE", "ARRIVAL", "ENTRY", "AIRPORT", "SEAPORT", "INDIA"]):
+                        # Anchor strictly on rubber ink stamp terms, NOT passport page headers
+                        if any(kw in ocr_upper for kw in ["IMMIGRATION", "ARRIVAL", "ENTRY"]):
                             found_angle = test_angle
-                            logger.info(f"[{job_id}] Stamp orientation matched anchor at {test_angle}° rotation.")
+                            logger.info(f"[{job_id}] Entry stamp rubber ink matched anchor at {test_angle}° rotation.")
                             break
                     
                     if found_angle is not None and found_angle != 0:
                         best_stamp_angle = found_angle
-                        logger.info(f"[{job_id}] Rotating stamp image by {best_stamp_angle}° to ensure upright orientation.")
+                        logger.info(f"[{job_id}] Rotating stamp image by {best_stamp_angle}° for upright stamp alignment.")
                         stamp_image = stamp_image.rotate(best_stamp_angle, expand=True)
                     else:
-                        logger.info(f"[{job_id}] Stamp orientation check native 0° retained.")
+                        logger.info(f"[{job_id}] Stamp orientation check retained native 0°.")
                 except Exception as stamp_orient_err:
                     logger.warning(f"[{job_id}] Stamp orientation detection bypassed: {stamp_orient_err}")
 
                 stamp_prompt = (
-                    "You are an administrative document verification assistant inspecting an Indian immigration entry/arrival rubber stamp image.\n"
+                    "You are an administrative document verification assistant inspecting a passport page.\n"
+                    "CRITICAL: The page may contain printed passport booklet text (such as country names, 'Visas', or page numbers). IGNORE all printed booklet text completely.\n"
+                    "Focus ONLY on the physical colored rubber ink arrival/entry stamp impressed on the page (usually rectangular or oval with an Indian immigration header, an airport/seaport code, and a stamped date).\n"
                     "Extract the arrival details into a valid JSON object matching this schema:\n"
                     "{\n"
                     '  "arrival_date": {"value": string or null, "confidence": float},\n'
@@ -741,10 +742,10 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     "}\n"
                     "Instructions:\n"
                     "- Read only ARRIVAL or ENTRY stamps. Ignore departure or exit stamps.\n"
-                    "- Transcribe the exact port or airport name printed on the arrival stamp borders (e.g. 'COCHIN SEAPORT', 'DELHI AIRPORT', 'TRIVANDRUM INTL AIRPORT', 'MUMBAI').\n"
-                    "- For arrival_date, transcribe the date printed or stamped across the center of the arrival stamp.\n"
+                    "- For arrival_port, transcribe ONLY the exact airport or seaport name physically printed or stamped on the rubber stamp border. "
+                    "If cut off, smudged, or illegible, return null for value and 0.0 for confidence. DO NOT guess, invent, or assume any city or port names.\n"
+                    "- For arrival_date, transcribe the genuine date printed or stamped across the center of the arrival stamp.\n"
                     "- If cut off, smudged, or illegible, return null for value and 0.0 for confidence.\n"
-                    "- If the arrival date is illegible or not present, return null for value and 0.0 for confidence.\n"
                     "- Output JSON only."
                 )
                 vlm_stamp = await asyncio.to_thread(run_vlm_inference, stamp_image, stamp_prompt, ml_state, "Stamp VLM")
@@ -759,13 +760,13 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
             logger.info(f"[{job_id}] Stage 3/4: No entry_stamp document attached to job. Skipping.")
 
         # ======================================================================
-        # 4. HANDWRITTEN FORM-C ARRIVAL REPORT (OCR-GROUNDED TWO-PASS EXTRACTION)
+        # 4. HANDWRITTEN FORM-C ARRIVAL REPORT (OCR-GROUNDED SINGLE UNIFIED PASS)
         # ======================================================================
         doc_paths = refresh_document_paths(job_id)
         welcome_path = doc_paths.get("welcome_form")
 
         if welcome_path and os.path.exists(welcome_path):
-            logger.info(f"[{job_id}] Stage 4/4: Initializing OCR-grounded Form-C extraction ({welcome_path})...")
+            logger.info(f"[{job_id}] Stage 4/4: Initializing OCR-grounded full-page Form-C extraction ({welcome_path})...")
             welcome_raw = await asyncio.to_thread(load_and_preprocess_image, welcome_path)
             
             if welcome_raw:
@@ -773,7 +774,7 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                 # Robust Header-Grounded 180° Inversion Guard for Form-C:
                 # Tests for "ARRIVAL" or "FORM C" in top 35% crop. If absent,
                 # checks a 180° flipped crop. If present, rotates 180° so the
-                # document is upright before Pass 4A and Pass 4B cropping.
+                # document is upright before full-page inference.
                 # --------------------------------------------------------------
                 try:
                     sample_thumb = welcome_raw.copy()
@@ -801,40 +802,22 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     logger.warning(f"[{job_id}] Form-C header orientation test bypassed: {orient_err}")
 
                 img_w, img_h = welcome_raw.size
+                logger.info(f"[{job_id}] Running unified full-document extraction on Form-C ({img_w}x{img_h})...")
 
-                # ------------------------------------------------------------------
-                # Pass 4A: Top Section (Rows 1 to 5: Identity, Residence, Visa, Arrival)
-                # Crop top 60% of the document to ensure Row 2 sub-grid is fully captured
-                # ------------------------------------------------------------------
-                top_crop_box = (0, 0, img_w, int(img_h * 0.60))
-                welcome_top_img = welcome_raw.crop(top_crop_box)
-                logger.info(f"[{job_id}] Pass 4A: Cropped top section ({img_w}x{welcome_top_img.size[1]}).")
-
-                # Run fast local OCR specifically on the top crop to get ground-truth tokens
-                ocr_top_text = ""
+                # Run fast local OCR on the upright document to provide ground-truth character hints
+                ocr_full_text = ""
                 try:
-                    ocr_top_raw = await asyncio.to_thread(pytesseract.image_to_string, welcome_top_img)
-                    ocr_top_lines = [line.strip() for line in ocr_top_raw.splitlines() if line.strip()]
-                    ocr_top_text = "\n".join(ocr_top_lines)
+                    ocr_full_raw = await asyncio.to_thread(pytesseract.image_to_string, welcome_raw)
+                    ocr_full_lines = [line.strip() for line in ocr_full_raw.splitlines() if line.strip()]
+                    ocr_full_text = "\n".join(ocr_full_lines)
                 except Exception as e:
-                    ocr_top_text = "No OCR hints available."
+                    ocr_full_text = "No OCR hints available."
 
-                welcome_top_prompt = (
-                    "You are an administrative office assistant digitizing the top section (Rows 1 to 5) of an official Form C (Rule 14) Arrival Report homestay registration card.\n"
-                    "CRITICAL: The card contains pre-printed letterhead at the top ('HOMESTED, 1386 A, PARVATHY NILAYAM, THAMARAKULAM ROAD, KOCHI - 682 001'). IGNORE that homestay header completely.\n"
-                    "Extract ONLY the foreigner guest's handwritten entries in Rows 1 to 5.\n\n"
-                    "Here are raw OCR character tokens detected on this top section:\n"
-                    f"\"\"\"\n{ocr_top_text}\n\"\"\"\n\n"
-                    "Examine the numbered rows on the card:\n"
-                    "- Row 1: Name of foreigner (Surname First)\n"
-                    "- Row 2: Contains 3 horizontal sub-lines:\n"
-                    "    * Line 1: 'Full Address' (handwritten street address in home country)\n"
-                    "    * Line 2: 'City' (handwritten city/town) and 'Country' (handwritten home country)\n"
-                    "    * Line 3: 'E-mail' and 'Telphone / Mobile'\n"
-                    "- Row 3: Nationality\n"
-                    "- Row 4: Place of issue of visa\n"
-                    "- Row 5: Date of Arrival in India\n\n"
-                    "Transcribe the genuine handwriting into this JSON schema:\n"
+                welcome_full_prompt = (
+                    "You are an administrative office assistant digitizing an official Form C (Rule 14) Arrival Report homestay registration card.\n"
+                    "CRITICAL ANTI-HALLUCINATION INSTRUCTION: The card contains pre-printed homestay letterhead at the top ('HOMESTED, 1386 A, PARVATHY NILAYAM, THAMARAKULAM ROAD, KOCHI - 682 001'). "
+                    "Under NO circumstances extract 'HOMESTED', 'PARVATHY NILAYAM', 'KOCHI', or 'India' as the guest's address or city. IGNORE that homestay header completely.\n"
+                    "Extract ONLY the foreigner guest's genuine handwritten entries in Rows 1 to 12 into this JSON schema:\n"
                     "{\n"
                     '  "name_of_foreigner": {"value": string or null, "confidence": float},\n'
                     '  "full_address": {"value": string or null, "confidence": float},\n'
@@ -844,33 +827,58 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     '  "telephone_mobile": {"value": string or null, "confidence": float},\n'
                     '  "nationality": {"value": string or null, "confidence": float},\n'
                     '  "place_of_issue_of_visa": {"value": string or null, "confidence": float},\n'
-                    '  "date_of_arrival_in_india": {"value": "YYYY-MM-DD" or null, "confidence": float}\n'
-                    "}\n"
+                    '  "date_of_arrival_in_india": {"value": "YYYY-MM-DD" or null, "confidence": float},\n'
+                    '  "datetime_arrival_homestay": {"value": string or null, "confidence": float},\n'
+                    '  "arrived_from": {"value": string or null, "confidence": float},\n'
+                    '  "proceeding_to": {"value": string or null, "confidence": float},\n'
+                    '  "proposed_duration_stay_india": {"value": string or null, "confidence": float},\n'
+                    '  "purpose_of_visit_profession": {"value": string or null, "confidence": float},\n'
+                    '  "expected_date_departure": {"value": "YYYY-MM-DD" or null, "confidence": float},\n'
+                    '  "country_city_arrived_to_india": {"value": string or null, "confidence": float}\n'
+                    "}\n\n"
+                    "Numbered Row Breakdown on the Form:\n"
+                    "- Row 1: Name of foreigner (Surname First)\n"
+                    "- Row 2: Contains 3 sub-lines for the foreigner's permanent foreign residence:\n"
+                    "    * Line 1: 'Full Address' (handwritten street address in home country)\n"
+                    "    * Line 2: 'City' (handwritten foreign town) and 'Country' (handwritten foreign home country)\n"
+                    "    * Line 3: 'E-mail' and 'Telphone / Mobile'\n"
+                    "- Row 3: Nationality\n"
+                    "- Row 4: Place of issue of visa\n"
+                    "- Row 5: Date of Arrival in India\n"
+                    "- Row 6: Date and Time of Arrival in the home stay (e.g. '09.10.16 18:00' or '17/5/2026 12:00')\n"
+                    "- Row 7: Arrived from (city, state, or country written in row 7)\n"
+                    "- Row 8: Proceeding to (from here) (city, state, or country written in row 8)\n"
+                    "- Row 9: Proposed duration of stay in India (e.g. '2 days', '10 days', '1 month')\n"
+                    "- Row 10: Purpose of visit & your Profession (e.g. 'Tourist', 'Business')\n"
+                    "- Row 11: Expected date of departure (from here) (date written in row 11)\n"
+                    "- Row 12: Country & city you arrived to India (written in row 12)\n\n"
+                    "Here are raw OCR character tokens detected on the upright form to assist your reading:\n"
+                    f"\"\"\"\n{ocr_full_text}\n\"\"\"\n\n"
                     "Instructions:\n"
-                    "- full_address, city, and country MUST be the foreigner's permanent home address written by hand, NOT 'KOCHI' or 'India' from the homestay letterhead.\n"
-                    "- If a line is blank or empty, return null for value and 0.0 for confidence.\n"
+                    "- Transcribe only genuine handwriting. If a row or sub-line is blank, return null for value and 0.0 for confidence.\n"
                     "- Output JSON only."
                 )
 
-                vlm_form_top = await asyncio.to_thread(
+                vlm_form = await asyncio.to_thread(
                     run_vlm_inference,
-                    welcome_top_img,
-                    welcome_top_prompt,
+                    welcome_raw,
+                    welcome_full_prompt,
                     ml_state,
-                    "Welcome Form (Top Section) VLM",
-                    384,
+                    "Form-C Full Document VLM",
+                    448,
                     65536,
                     262144
                 )
 
-                fused_record.permanent_address = normalize_vlm_field(vlm_form_top.get("full_address"), source="welcome_form")
-                fused_record.city = normalize_vlm_field(vlm_form_top.get("city"), source="welcome_form")
-                fused_record.country = normalize_vlm_field(vlm_form_top.get("country"), source="welcome_form")
-                fused_record.contact_email = normalize_vlm_field(vlm_form_top.get("email"), source="welcome_form")
-                fused_record.contact_phone = normalize_vlm_field(vlm_form_top.get("telephone_mobile"), source="welcome_form")
+                # Map extracted Row 1-5 identity and residence fields
+                fused_record.permanent_address = normalize_vlm_field(vlm_form.get("full_address"), source="welcome_form")
+                fused_record.city = normalize_vlm_field(vlm_form.get("city"), source="welcome_form")
+                fused_record.country = normalize_vlm_field(vlm_form.get("country"), source="welcome_form")
+                fused_record.contact_email = normalize_vlm_field(vlm_form.get("email"), source="welcome_form")
+                fused_record.contact_phone = normalize_vlm_field(vlm_form.get("telephone_mobile"), source="welcome_form")
 
                 # Fallback guest name from Form-C if bio scan didn't capture surname or given names
-                form_c_name = normalize_vlm_field(vlm_form_top.get("name_of_foreigner"), source="welcome_form")
+                form_c_name = normalize_vlm_field(vlm_form.get("name_of_foreigner"), source="welcome_form")
                 if form_c_name.value and (not fused_record.given_names.value and not fused_record.surname.value):
                     parts = form_c_name.value.split(maxsplit=1)
                     fused_record.surname = FieldResult(value=parts[0], confidence=form_c_name.confidence, source="welcome_form")
@@ -879,84 +887,25 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
 
                 # Fallback bio comparisons if passport/visa didn't capture them
                 if not fused_record.visa_place_of_issue.value:
-                    fused_record.visa_place_of_issue = normalize_vlm_field(vlm_form_top.get("place_of_issue_of_visa"), source="welcome_form")
+                    fused_record.visa_place_of_issue = normalize_vlm_field(vlm_form.get("place_of_issue_of_visa"), source="welcome_form")
                 if not fused_record.arrival_date_india.value:
-                    fused_record.arrival_date_india = normalize_vlm_field(vlm_form_top.get("date_of_arrival_in_india"), source="welcome_form")
+                    fused_record.arrival_date_india = normalize_vlm_field(vlm_form.get("date_of_arrival_in_india"), source="welcome_form")
                 if not fused_record.nationality.value:
-                    fused_record.nationality = normalize_vlm_field(vlm_form_top.get("nationality"), source="welcome_form")
+                    fused_record.nationality = normalize_vlm_field(vlm_form.get("nationality"), source="welcome_form")
 
-                processing_notes.append("Form-C top section (identity & residence) extracted.")
-                fused_record.processing_notes = list(processing_notes)
-                save_intermediate_job_result(job_id, fused_record.model_dump())
-
-                # ------------------------------------------------------------------
-                # Pass 4B: Bottom Section (Rows 6 to 12: Homestay Arrival, Travel & Stay Dates)
-                # Crop lower section from 55% to 100% to cleanly focus on Rows 6 to 12
-                # ------------------------------------------------------------------
-                bottom_crop_box = (0, int(img_h * 0.55), img_w, img_h)
-                welcome_bottom_img = welcome_raw.crop(bottom_crop_box)
-                logger.info(f"[{job_id}] Pass 4B: Cropped bottom section ({img_w}x{welcome_bottom_img.size[1]}).")
-
-                # Run fast local OCR specifically on the bottom crop and provide all detected cues
-                ocr_bottom_text = ""
-                try:
-                    ocr_bottom_raw = await asyncio.to_thread(pytesseract.image_to_string, welcome_bottom_img)
-                    ocr_bottom_lines = [line.strip() for line in ocr_bottom_raw.splitlines() if line.strip()]
-                    ocr_bottom_text = "\n".join(ocr_bottom_lines)
-                except Exception as e:
-                    ocr_bottom_text = "No OCR hints available."
-
-                welcome_bottom_prompt = (
-                    "You are an administrative office assistant digitizing the bottom section (Rows 6 to 12) of an official Form C (Rule 14) Arrival Report homestay registration card.\n"
-                    "Here are raw OCR character tokens detected on this bottom section to guide your reading:\n"
-                    f"\"\"\"\n{ocr_bottom_text}\n\"\"\"\n\n"
-                    "Examine the numbered table rows on this slip:\n"
-                    "- Row 6: Date and Time of Arrival in the home stay (e.g., '17/5/2026 12:00' or '09.10.16 18:00')\n"
-                    "- Row 7: Arrived from (city or state name written in row 7, e.g., 'KERALA' or 'DELHI')\n"
-                    "- Row 8: Proceeding to (from here) (city or state name written in row 8, e.g., 'GOA' or 'GERMANY')\n"
-                    "- Row 9: Proposed duration of stay in India (e.g., '2 days' or '1 month')\n"
-                    "- Row 10: Purpose of visit & your Profession (e.g., 'Business', 'Tourism')\n"
-                    "- Row 11: Expected date of departure (from here) (date written in row 11)\n"
-                    "- Row 12: Country & city you arrived to India (written in row 12)\n\n"
-                    "Transcribe the genuine handwriting written into each row into this JSON schema:\n"
-                    "{\n"
-                    '  "datetime_arrival_homestay": {"value": string or null, "confidence": float},\n'
-                    '  "arrived_from": {"value": string or null, "confidence": float},\n'
-                    '  "proceeding_to": {"value": string or null, "confidence": float},\n'
-                    '  "proposed_duration_stay_india": {"value": string or null, "confidence": float},\n'
-                    '  "purpose_of_visit_profession": {"value": string or null, "confidence": float},\n'
-                    '  "expected_date_departure": {"value": "YYYY-MM-DD" or null, "confidence": float},\n'
-                    '  "country_city_arrived_to_india": {"value": string or null, "confidence": float}\n'
-                    "}\n"
-                    "Instructions:\n"
-                    "- Transcribe only genuine handwriting written on these rows.\n"
-                    "- If a row is blank or empty, return null for value and 0.0 for confidence.\n"
-                    "- Output JSON only."
-                )
-
-                vlm_form_bottom = await asyncio.to_thread(
-                    run_vlm_inference,
-                    welcome_bottom_img,
-                    welcome_bottom_prompt,
-                    ml_state,
-                    "Welcome Form (Bottom Section) VLM",
-                    384,
-                    65536,
-                    262144
-                )
-
-                fused_record.arrival_datetime_homestay = normalize_vlm_field(vlm_form_bottom.get("datetime_arrival_homestay"), source="welcome_form")
-                fused_record.arrived_from = normalize_vlm_field(vlm_form_bottom.get("arrived_from"), source="welcome_form")
-                fused_record.proceeding_to = normalize_vlm_field(vlm_form_bottom.get("proceeding_to"), source="welcome_form")
+                # Map extracted Row 6-12 homestay and travel movement fields
+                fused_record.arrival_datetime_homestay = normalize_vlm_field(vlm_form.get("datetime_arrival_homestay"), source="welcome_form")
+                fused_record.arrived_from = normalize_vlm_field(vlm_form.get("arrived_from"), source="welcome_form")
+                fused_record.proceeding_to = normalize_vlm_field(vlm_form.get("proceeding_to"), source="welcome_form")
                 fused_record.stay_duration_india = normalize_vlm_field(
-                    vlm_form_bottom.get("proposed_duration_stay_india") or vlm_form_bottom.get("stay_duration_india"),
+                    vlm_form.get("proposed_duration_stay_india") or vlm_form.get("stay_duration_india"),
                     source="welcome_form"
                 )
-                fused_record.purpose_of_visit = normalize_vlm_field(vlm_form_bottom.get("purpose_of_visit_profession"), source="welcome_form")
-                fused_record.expected_departure_date = normalize_vlm_field(vlm_form_bottom.get("expected_date_departure"), source="welcome_form")
-                fused_record.arrived_country_city_india = normalize_vlm_field(vlm_form_bottom.get("country_city_arrived_to_india"), source="welcome_form")
+                fused_record.purpose_of_visit = normalize_vlm_field(vlm_form.get("purpose_of_visit_profession"), source="welcome_form")
+                fused_record.expected_departure_date = normalize_vlm_field(vlm_form.get("expected_date_departure"), source="welcome_form")
+                fused_record.arrived_country_city_india = normalize_vlm_field(vlm_form.get("country_city_arrived_to_india"), source="welcome_form")
 
-                processing_notes.append("Form-C bottom section (homestay & travel dates) extracted.")
+                processing_notes.append("Form-C arrival report (Rows 1-12) extracted via unified single-pass VLM.")
         else:
             logger.info(f"[{job_id}] Stage 4/4: No welcome_form document attached to job. Skipping.")
 
