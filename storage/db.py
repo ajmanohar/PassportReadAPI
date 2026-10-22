@@ -1,7 +1,12 @@
 """
+==============================================================================
+storage/db.py - PassportReadAPI
+==============================================================================
 SQLite database storage layer for PassportReadAPI.
 Manages schema initialization, job lifecycle state transitions, document path manifests,
-progressive intermediate extraction persistence for asynchronous batch jobs, and startup recovery.
+progressive intermediate extraction persistence for asynchronous batch jobs,
+startup recovery, and cascading job deletion.
+==============================================================================
 """
 
 import json
@@ -31,11 +36,8 @@ def get_db_connection() -> sqlite3.Connection:
     Creates and returns a SQLite database connection configured with
     row factory for dictionary-like column access and immediate timeout.
     """
-    # Ensure storage directory exists on the filesystem
     os.makedirs(STORAGE_DIR, exist_ok=True)
-    # Establish connection with a 30s timeout to handle concurrent disk writes
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
-    # Enable access by column name
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -52,7 +54,6 @@ def init_db() -> None:
     logger.info(f"[*] Initializing SQLite database schema at: {DB_PATH}")
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        # Create jobs tracking table
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS jobs (
@@ -66,7 +67,6 @@ def init_db() -> None:
             );
             """
         )
-        # Create index to accelerate pending/processing status lookups
         cursor.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_jobs_status_created 
@@ -77,46 +77,8 @@ def init_db() -> None:
     logger.info("[*] SQLite database schema initialized successfully.")
 
 
-# Alias for backwards compatibility with app.py imports
+# Convenience alias for application startup hooks
 initialize_database = init_db
-
-
-# ==============================================================================
-# Job Recovery on Server Startup
-# ==============================================================================
-
-def get_all_pending_jobs() -> List[Dict[str, Any]]:
-    """
-    Queries SQLite for any jobs left in 'QUEUED' or 'PROCESSING' state on system startup
-    so the background queue worker can re-enqueue and complete them after server reboot.
-
-    :return: List of job record dictionaries that require processing.
-    """
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT job_id, status, created_at, updated_at, doc_paths_json, result_json, error_message
-            FROM jobs
-            WHERE status IN ('QUEUED', 'PROCESSING')
-            ORDER BY created_at ASC;
-            """
-        )
-        rows = cursor.fetchall()
-
-    pending_jobs = []
-    for row in rows:
-        pending_jobs.append({
-            "job_id": row["job_id"],
-            "status": row["status"],
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-            "doc_paths": json.loads(row["doc_paths_json"]) if row["doc_paths_json"] else {},
-            "result": json.loads(row["result_json"]) if row["result_json"] else None,
-            "error_message": row["error_message"]
-        })
-    logger.info(f"[*] Recovered {len(pending_jobs)} pending job(s) from SQLite on startup.")
-    return pending_jobs
 
 
 # ==============================================================================
@@ -176,7 +138,7 @@ def save_intermediate_job_result(job_id: str, result_dict: Dict[str, Any]) -> No
     """
     Progressively persists partial extraction results into SQLite while keeping
     status as 'PROCESSING'. This enables real-time polling by mobile clients so
-    individual stage badges can turn green before all 4 stages finish.
+    individual stage badges can turn green before all stages finish.
 
     :param job_id: Unique job identifier string.
     :param result_dict: Serialized dictionary of the current GuestFormCRecord model.
@@ -220,6 +182,23 @@ def save_job_result(job_id: str, result_dict: Dict[str, Any]) -> None:
         )
         conn.commit()
         logger.info(f"[+] Persisted final extraction result for job: {job_id}")
+
+
+def delete_job_record(job_id: str) -> bool:
+    """
+    Permanently deletes a job row from the SQLite database.
+    Used during mobile-triggered submission deletion (Task 44).
+
+    :param job_id: UUID of the job to remove.
+    :return: True if a row was found and removed, False otherwise.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM jobs WHERE job_id = ?;", (job_id,))
+        conn.commit()
+        deleted_count = cursor.rowcount
+        logger.info(f"[*] Deleted job {job_id} from SQLite (rows affected: {deleted_count})")
+        return deleted_count > 0
 
 
 # ==============================================================================
@@ -291,3 +270,38 @@ def list_recent_jobs(limit: int = 50) -> List[Dict[str, Any]]:
             "error_message": row["error_message"]
         })
     return results
+
+
+def get_all_pending_jobs(limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    Retrieves jobs currently in 'QUEUED' or 'PROCESSING' state for server restart recovery.
+
+    :param limit: Maximum count of pending jobs to recover.
+    :return: List of pending job dictionaries.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT job_id, status, created_at, updated_at, doc_paths_json, result_json, error_message
+            FROM jobs
+            WHERE status IN ('QUEUED', 'PROCESSING')
+            ORDER BY created_at ASC
+            LIMIT ?;
+            """,
+            (limit,)
+        )
+        rows = cursor.fetchall()
+
+    pending = []
+    for row in rows:
+        pending.append({
+            "job_id": row["job_id"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "doc_paths": json.loads(row["doc_paths_json"]) if row["doc_paths_json"] else {},
+            "result": json.loads(row["result_json"]) if row["result_json"] else None,
+            "error_message": row["error_message"]
+        })
+    return pending
