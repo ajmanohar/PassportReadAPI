@@ -2,22 +2,19 @@
 # job_worker.py - PassportReadAPI
 # ==============================================================================
 # Background batch execution pipeline and serial queue worker for asynchronous Form-C jobs.
-# Processes multi-document bundles (Passport Bio, Visa, Entry Stamp, Welcome Form) sequentially.
-# Executes an unconditional 'best-of-both' confidence tournament between Tesseract MRZ and
-# Qwen2-VL for the Passport Bio page, selecting the highest-confidence extraction per field.
+# Processes multi-document bundles sequentially:
+#   Stage 1: Passport Bio-Data (Tesseract MRZ + Qwen2-VL tournament)
+#   Stage 2A: e-Visa Paper / PDF Document Extraction (Qwen2-VL)
+#   Stage 2B: Passport Booklet Consular Visa Stamp Extraction (Qwen2-VL)
+#   Stage 3: Immigration Arrival Rubber Ink Stamp Extraction (Qwen2-VL)
+#   Stage 4: Handwritten Form-C Rule 14 Arrival Report (OCR-grounded full-page Qwen2-VL)
 #
-# Server-Side Document Normalization:
-# - Applies EXIF transposition to correct camera orientation tags.
-# - High-confidence OSD thresholding: Ignores low-confidence (< 2.0) or non-Latin OSD false positives.
-# - Stamp 4-Way Orientation Guard: Evaluates 0°, 90°, 180°, 270° rotations specifically for
-#   immigration stamp markings ('IMMIGRATION', 'ARRIVAL', 'ENTRY') while ignoring passport book footers.
-# - Form-C Deterministic Orientation: Checks for 'ARRIVAL REPORT' or 'FORM C' in top crop;
-#   if absent, tests 180° flip and rotates to guarantee upright document presentation.
-# - Single Full-Document Form-C Extraction: Processes Rows 1-12 in one unified visual pass
-#   with 262k visual patch allocation and OCR token grounding, eliminating crop seam errors.
-# - Anti-Hallucination Guardrails: Prevents pre-printed homestay letterhead ('Kochi') from
-#   overriding the guest's foreign residential address.
-# - Resilient Queue Ingestion: Safely handles both raw UUID strings and startup recovery dicts.
+# Key Architectural Features:
+# - Task 45: Populates isolated per-document data models in fused_record.documents
+#   so raw extractions from one document never overwrite or conflict with another.
+# - Task 42: Differentiates e-Visa Paper Document vs. Passport Booklet Visa Stamp.
+# - Offline Enforcement: Uses local_files_only to prevent Hugging Face Hub phone-home checks.
+# - Preserves full backward compatibility on top-level fields for existing clients.
 # ==============================================================================
 
 import asyncio
@@ -38,7 +35,16 @@ from passporteye import read_mrz
 # Central configuration and repository imports
 from config import settings
 from storage.db import update_job_status, save_intermediate_job_result, save_job_result, get_job
-from schemas.job import GuestFormCRecord, FieldResult
+from schemas.job import (
+    GuestFormCRecord,
+    FieldResult,
+    DocumentExtractionContainer,
+    PassportBioRecord,
+    VisaDocumentRecord,
+    VisaStampRecord,
+    EntryStampRecord,
+    FormCReportRecord
+)
 
 # Set up module-level logger
 logger = logging.getLogger("job_worker")
@@ -59,6 +65,7 @@ FORBIDDEN_HALLUCINATIONS: List[str] = [
     "123-456-7890",
     "example@domain.com",
     "9876543210",
+    "09876543210",
     "dummy",
     "lorem ipsum",
     "john.doe"
@@ -421,6 +428,7 @@ def select_best_field(
 def refresh_document_paths(job_id: str) -> Dict[str, str]:
     """
     Queries SQLite and inspects the on-disk job directory to discover attached files.
+    Supports passport_bio, visa_document, visa_stamp, legacy visa_page, entry_stamp, and welcome_form.
 
     :param job_id: UUID tracking string.
     :return: Mapping of document types to verified local file paths.
@@ -436,6 +444,10 @@ def refresh_document_paths(job_id: str) -> Dict[str, str]:
                 continue
             if (filename.startswith("bio_") or filename.startswith("passport_bio_")) and "passport_bio" not in doc_paths:
                 doc_paths["passport_bio"] = full_path
+            elif filename.startswith("visadoc_") and "visa_document" not in doc_paths:
+                doc_paths["visa_document"] = full_path
+            elif filename.startswith("visastamp_") and "visa_stamp" not in doc_paths:
+                doc_paths["visa_stamp"] = full_path
             elif (filename.startswith("visa_") or filename.startswith("visa_page_")) and "visa_page" not in doc_paths:
                 doc_paths["visa_page"] = full_path
             elif (filename.startswith("stamp_") or filename.startswith("entry_stamp_")) and "entry_stamp" not in doc_paths:
@@ -455,6 +467,7 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
     Executes the multi-document extraction pipeline for a single queued job.
     Uses neutral administrative framing, high-definition visual patches, and
     OCR-assisted hints on Form-C to decipher cursive handwriting.
+    Populates both the fused composite record and isolated per-document data buckets.
 
     :param job_input: Either a UUID string or a recovered dictionary holding 'job_id'.
     :param ml_state: Shared dictionary holding model handles.
@@ -473,6 +486,7 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
     update_job_status(job_id, "PROCESSING")
 
     fused_record = GuestFormCRecord()
+    fused_record.documents = DocumentExtractionContainer()
     processing_notes: List[str] = []
 
     try:
@@ -639,6 +653,18 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                 processing_notes
             )
 
+            # Task 45: Persist isolated PassportBioRecord
+            fused_record.documents.passport_bio = PassportBioRecord(
+                surname=fused_record.surname,
+                given_names=fused_record.given_names,
+                sex=fused_record.sex,
+                date_of_birth=fused_record.date_of_birth,
+                nationality=fused_record.nationality,
+                passport_number=fused_record.passport_number,
+                passport_expiry_date=fused_record.passport_expiry_date,
+                valid_mrz=fused_record.valid_mrz
+            )
+
             fused_record.processing_notes = list(processing_notes)
             save_intermediate_job_result(job_id, fused_record.model_dump())
             logger.info(f"[{job_id}] Stage 1/4 completed and intermediate state persisted to database.")
@@ -647,17 +673,17 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
             processing_notes.append("Passport bio image missing from job directory.")
 
         # ======================================================================
-        # 2. VISA / OCI EXTRACTION (QWEN2-VL)
+        # 2A. VISA DOCUMENT (E-VISA PAPER / PDF PRINT) - TASK 42
         # ======================================================================
         doc_paths = refresh_document_paths(job_id)
-        visa_path = doc_paths.get("visa_page")
+        visa_doc_path = doc_paths.get("visa_document") or (doc_paths.get("visa_page") if "visa_stamp" in doc_paths else None)
 
-        if visa_path and os.path.exists(visa_path):
-            logger.info(f"[{job_id}] Stage 2/4: Running Qwen2-VL visa extraction ({visa_path})...")
-            visa_image = await asyncio.to_thread(load_and_preprocess_image, visa_path)
-            if visa_image:
-                visa_prompt = (
-                    "You are an administrative document verification assistant inspecting an Indian Visa sticker or OCI card document image.\n"
+        if visa_doc_path and os.path.exists(visa_doc_path):
+            logger.info(f"[{job_id}] Stage 2A: Running Qwen2-VL e-Visa document extraction ({visa_doc_path})...")
+            vdoc_image = await asyncio.to_thread(load_and_preprocess_image, visa_doc_path)
+            if vdoc_image:
+                vdoc_prompt = (
+                    "You are an administrative document verification assistant inspecting an Indian e-Visa paper printout or OCI card document image.\n"
                     "Extract only the text physically printed on the document into a valid JSON object matching this schema:\n"
                     "{\n"
                     '  "visa_number": {"value": string or null, "confidence": float},\n'
@@ -667,26 +693,87 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     '  "place_of_issue": {"value": string or null, "confidence": float}\n'
                     "}\n"
                     "Instructions:\n"
-                    "- For visa_number, look for 'Visa No', 'Document No', or the bold 7 to 9 character alphanumeric identifier.\n"
+                    "- For visa_number, look for 'Visa No', 'Document No', or the bold alphanumeric identifier.\n"
                     "- For visa_type, look for the category such as 'TOURIST', 'T', 'BUSINESS', 'X', 'OCI', or 'STUDENT'.\n"
-                    "- If an expiry date is not printed on the document, return null for expiry_date. Do not calculate or assume an expiry date based on the issue date.\n"
-                    "- For place_of_issue, transcribe the exact issuing mission or authority printed on the document. If not printed or illegible, return null.\n"
+                    "- If an expiry date is not printed on the document, return null for expiry_date.\n"
+                    "- For place_of_issue, transcribe the exact issuing mission or authority printed on the document.\n"
                     "- If any field is missing or unreadable, return null for value and 0.0 for confidence.\n"
                     "- Output JSON only."
                 )
-                vlm_visa = await asyncio.to_thread(run_vlm_inference, visa_image, visa_prompt, ml_state, "Visa VLM")
-                fused_record.visa_number = normalize_vlm_field(vlm_visa.get("visa_number"))
-                fused_record.visa_type = normalize_vlm_field(vlm_visa.get("visa_type"))
-                fused_record.visa_issue_date = normalize_vlm_field(vlm_visa.get("issue_date"))
-                fused_record.visa_expiry_date = normalize_vlm_field(vlm_visa.get("expiry_date"))
-                fused_record.visa_place_of_issue = normalize_vlm_field(vlm_visa.get("place_of_issue"))
-                processing_notes.append("Visa / OCI details extracted via Qwen2-VL.")
-
+                vlm_vdoc = await asyncio.to_thread(run_vlm_inference, vdoc_image, vdoc_prompt, ml_state, "Visa Document VLM")
+                
+                # Isolated container for Visa Document
+                fused_record.documents.visa_document = VisaDocumentRecord(
+                    visa_number=normalize_vlm_field(vlm_vdoc.get("visa_number"), source="visa_document"),
+                    visa_type=normalize_vlm_field(vlm_vdoc.get("visa_type"), source="visa_document"),
+                    visa_issue_date=normalize_vlm_field(vlm_vdoc.get("issue_date"), source="visa_document"),
+                    visa_expiry_date=normalize_vlm_field(vlm_vdoc.get("expiry_date"), source="visa_document"),
+                    visa_place_of_issue=normalize_vlm_field(vlm_vdoc.get("place_of_issue"), source="visa_document")
+                )
+                
+                # Populate top-level fields for backwards compatibility
+                fused_record.visa_number = fused_record.documents.visa_document.visa_number
+                fused_record.visa_type = fused_record.documents.visa_document.visa_type
+                fused_record.visa_issue_date = fused_record.documents.visa_document.visa_issue_date
+                fused_record.visa_expiry_date = fused_record.documents.visa_document.visa_expiry_date
+                fused_record.visa_place_of_issue = fused_record.documents.visa_document.visa_place_of_issue
+                
+                processing_notes.append("e-Visa document details extracted via Qwen2-VL.")
                 fused_record.processing_notes = list(processing_notes)
                 save_intermediate_job_result(job_id, fused_record.model_dump())
-                logger.info(f"[{job_id}] Stage 2/4 completed and intermediate state persisted to database.")
-        else:
-            logger.info(f"[{job_id}] Stage 2/4: No visa_page document attached to job. Skipping.")
+                logger.info(f"[{job_id}] Stage 2A completed and intermediate state persisted to database.")
+
+        # ======================================================================
+        # 2B. VISA STAMP (PASSPORT BOOKLET CONSULAR STICKER/STAMP) - TASK 42
+        # ======================================================================
+        doc_paths = refresh_document_paths(job_id)
+        visa_stamp_path = doc_paths.get("visa_stamp") or (doc_paths.get("visa_page") if "visa_document" not in doc_paths else None)
+
+        if visa_stamp_path and os.path.exists(visa_stamp_path):
+            logger.info(f"[{job_id}] Stage 2B: Running Qwen2-VL passport booklet visa stamp extraction ({visa_stamp_path})...")
+            vstamp_image = await asyncio.to_thread(load_and_preprocess_image, visa_stamp_path)
+            if vstamp_image:
+                vstamp_prompt = (
+                    "You are an administrative document verification assistant inspecting a physical consular visa sticker or stamp on a passport page.\n"
+                    "Extract only the text physically printed on the visa sticker into a valid JSON object matching this schema:\n"
+                    "{\n"
+                    '  "visa_number": {"value": string or null, "confidence": float},\n'
+                    '  "visa_type": {"value": string or null, "confidence": float},\n'
+                    '  "issue_date": {"value": string or null, "confidence": float},\n'
+                    '  "expiry_date": {"value": string or null, "confidence": float},\n'
+                    '  "place_of_issue": {"value": string or null, "confidence": float}\n'
+                    "}\n"
+                    "Instructions:\n"
+                    "- For visa_number, look for 'Visa No', 'Document No', or the bold 7 to 9 character alphanumeric identifier.\n"
+                    "- For visa_type, look for 'TOURIST', 'T', 'BUSINESS', 'X', 'OCI', or 'STUDENT'.\n"
+                    "- If an expiry date is not printed, return null for expiry_date.\n"
+                    "- For place_of_issue, transcribe the exact issuing mission or authority printed on the sticker.\n"
+                    "- If any field is missing or unreadable, return null for value and 0.0 for confidence.\n"
+                    "- Output JSON only."
+                )
+                vlm_vstamp = await asyncio.to_thread(run_vlm_inference, vstamp_image, vstamp_prompt, ml_state, "Visa Stamp VLM")
+                
+                # Isolated container for Visa Stamp
+                fused_record.documents.visa_stamp = VisaStampRecord(
+                    visa_number=normalize_vlm_field(vlm_vstamp.get("visa_number"), source="visa_stamp"),
+                    visa_type=normalize_vlm_field(vlm_vstamp.get("visa_type"), source="visa_stamp"),
+                    visa_issue_date=normalize_vlm_field(vlm_vstamp.get("issue_date"), source="visa_stamp"),
+                    visa_expiry_date=normalize_vlm_field(vlm_vstamp.get("expiry_date"), source="visa_stamp"),
+                    visa_place_of_issue=normalize_vlm_field(vlm_vstamp.get("place_of_issue"), source="visa_stamp")
+                )
+                
+                # If top-level visa_number was not populated by a visa_document, populate with stamp
+                if not fused_record.visa_number.value:
+                    fused_record.visa_number = fused_record.documents.visa_stamp.visa_number
+                    fused_record.visa_type = fused_record.documents.visa_stamp.visa_type
+                    fused_record.visa_issue_date = fused_record.documents.visa_stamp.visa_issue_date
+                    fused_record.visa_expiry_date = fused_record.documents.visa_stamp.visa_expiry_date
+                    fused_record.visa_place_of_issue = fused_record.documents.visa_stamp.visa_place_of_issue
+
+                processing_notes.append("Passport booklet visa stamp details extracted via Qwen2-VL.")
+                fused_record.processing_notes = list(processing_notes)
+                save_intermediate_job_result(job_id, fused_record.model_dump())
+                logger.info(f"[{job_id}] Stage 2B completed and intermediate state persisted to database.")
 
         # ======================================================================
         # 3. IMMIGRATION ENTRY STAMP EXTRACTION (QWEN2-VL)
@@ -699,12 +786,7 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
             stamp_image = await asyncio.to_thread(load_and_preprocess_image, stamp_path)
             
             if stamp_image:
-                # --------------------------------------------------------------
-                # Orientation Guard for Entry Stamp:
-                # Tests 0°, 270°, 90°, 180° rotations specifically looking for
-                # immigration stamp anchor keywords ('IMMIGRATION', 'ARRIVAL', 'ENTRY')
-                # while ignoring passport booklet headers/footers ('Visas', 'Sichtvermerke').
-                # --------------------------------------------------------------
+                # Orientation Guard: Checks specifically for stamp ink keywords
                 best_stamp_angle = 0
                 try:
                     thumb_stamp = stamp_image.copy()
@@ -716,7 +798,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                         ocr_txt = await asyncio.to_thread(pytesseract.image_to_string, rotated_thumb)
                         ocr_upper = ocr_txt.upper()
                         
-                        # Anchor strictly on rubber ink stamp terms, NOT passport page headers
                         if any(kw in ocr_upper for kw in ["IMMIGRATION", "ARRIVAL", "ENTRY"]):
                             found_angle = test_angle
                             logger.info(f"[{job_id}] Entry stamp rubber ink matched anchor at {test_angle}° rotation.")
@@ -749,10 +830,18 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     "- Output JSON only."
                 )
                 vlm_stamp = await asyncio.to_thread(run_vlm_inference, stamp_image, stamp_prompt, ml_state, "Stamp VLM")
-                fused_record.arrival_date_india = normalize_vlm_field(vlm_stamp.get("arrival_date"))
-                fused_record.arrival_port_india = normalize_vlm_field(vlm_stamp.get("arrival_port"))
+                
+                # Isolated container for Entry Stamp
+                fused_record.documents.entry_stamp = EntryStampRecord(
+                    arrival_date_india=normalize_vlm_field(vlm_stamp.get("arrival_date"), source="entry_stamp"),
+                    arrival_port_india=normalize_vlm_field(vlm_stamp.get("arrival_port"), source="entry_stamp")
+                )
+                
+                # Populate top-level fields for backwards compatibility
+                fused_record.arrival_date_india = fused_record.documents.entry_stamp.arrival_date_india
+                fused_record.arrival_port_india = fused_record.documents.entry_stamp.arrival_port_india
+                
                 processing_notes.append("Entry stamp details extracted via Qwen2-VL.")
-
                 fused_record.processing_notes = list(processing_notes)
                 save_intermediate_job_result(job_id, fused_record.model_dump())
                 logger.info(f"[{job_id}] Stage 3/4 completed and intermediate state persisted to database.")
@@ -760,7 +849,7 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
             logger.info(f"[{job_id}] Stage 3/4: No entry_stamp document attached to job. Skipping.")
 
         # ======================================================================
-        # 4. HANDWRITTEN FORM-C ARRIVAL REPORT (OCR-GROUNDED SINGLE UNIFIED PASS)
+        # 4. HANDWRITTEN FORM-C ARRIVAL REPORT (OCR-GROUNDED UNIFIED PASS)
         # ======================================================================
         doc_paths = refresh_document_paths(job_id)
         welcome_path = doc_paths.get("welcome_form")
@@ -770,12 +859,7 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
             welcome_raw = await asyncio.to_thread(load_and_preprocess_image, welcome_path)
             
             if welcome_raw:
-                # --------------------------------------------------------------
-                # Robust Header-Grounded 180° Inversion Guard for Form-C:
-                # Tests for "ARRIVAL" or "FORM C" in top 35% crop. If absent,
-                # checks a 180° flipped crop. If present, rotates 180° so the
-                # document is upright before full-page inference.
-                # --------------------------------------------------------------
+                # 180° Inversion Guard for Form-C
                 try:
                     sample_thumb = welcome_raw.copy()
                     sample_thumb.thumbnail((800, 800))
@@ -804,7 +888,7 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                 img_w, img_h = welcome_raw.size
                 logger.info(f"[{job_id}] Running unified full-document extraction on Form-C ({img_w}x{img_h})...")
 
-                # Run fast local OCR on the upright document to provide ground-truth character hints
+                # Local OCR character tokens for grounding hints
                 ocr_full_text = ""
                 try:
                     ocr_full_raw = await asyncio.to_thread(pytesseract.image_to_string, welcome_raw)
@@ -870,40 +954,60 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     262144
                 )
 
-                # Map extracted Row 1-5 identity and residence fields
-                fused_record.permanent_address = normalize_vlm_field(vlm_form.get("full_address"), source="welcome_form")
-                fused_record.city = normalize_vlm_field(vlm_form.get("city"), source="welcome_form")
-                fused_record.country = normalize_vlm_field(vlm_form.get("country"), source="welcome_form")
-                fused_record.contact_email = normalize_vlm_field(vlm_form.get("email"), source="welcome_form")
-                fused_record.contact_phone = normalize_vlm_field(vlm_form.get("telephone_mobile"), source="welcome_form")
+                # Isolated container for Form-C (Task 45)
+                fused_record.documents.welcome_form = FormCReportRecord(
+                    name_of_foreigner=normalize_vlm_field(vlm_form.get("name_of_foreigner"), source="welcome_form"),
+                    permanent_address=normalize_vlm_field(vlm_form.get("full_address"), source="welcome_form"),
+                    city=normalize_vlm_field(vlm_form.get("city"), source="welcome_form"),
+                    country=normalize_vlm_field(vlm_form.get("country"), source="welcome_form"),
+                    contact_email=normalize_vlm_field(vlm_form.get("email"), source="welcome_form"),
+                    contact_phone=normalize_vlm_field(vlm_form.get("telephone_mobile"), source="welcome_form"),
+                    nationality=normalize_vlm_field(vlm_form.get("nationality"), source="welcome_form"),
+                    place_of_issue_of_visa=normalize_vlm_field(vlm_form.get("place_of_issue_of_visa"), source="welcome_form"),
+                    date_of_arrival_in_india=normalize_vlm_field(vlm_form.get("date_of_arrival_in_india"), source="welcome_form"),
+                    arrival_datetime_homestay=normalize_vlm_field(vlm_form.get("datetime_arrival_homestay"), source="welcome_form"),
+                    arrived_from=normalize_vlm_field(vlm_form.get("arrived_from"), source="welcome_form"),
+                    proceeding_to=normalize_vlm_field(vlm_form.get("proceeding_to"), source="welcome_form"),
+                    stay_duration_india=normalize_vlm_field(
+                        vlm_form.get("proposed_duration_stay_india") or vlm_form.get("stay_duration_india"),
+                        source="welcome_form"
+                    ),
+                    purpose_of_visit=normalize_vlm_field(vlm_form.get("purpose_of_visit_profession"), source="welcome_form"),
+                    expected_departure_date=normalize_vlm_field(vlm_form.get("expected_date_departure"), source="welcome_form"),
+                    arrived_country_city_india=normalize_vlm_field(vlm_form.get("country_city_arrived_to_india"), source="welcome_form")
+                )
 
-                # Fallback guest name from Form-C if bio scan didn't capture surname or given names
-                form_c_name = normalize_vlm_field(vlm_form.get("name_of_foreigner"), source="welcome_form")
+                # Populate composite top-level fields
+                fused_record.permanent_address = fused_record.documents.welcome_form.permanent_address
+                fused_record.city = fused_record.documents.welcome_form.city
+                fused_record.country = fused_record.documents.welcome_form.country
+                fused_record.contact_email = fused_record.documents.welcome_form.contact_email
+                fused_record.contact_phone = fused_record.documents.welcome_form.contact_phone
+
+                # Fallback guest name from Form-C only if bio scan was unextracted
+                form_c_name = fused_record.documents.welcome_form.name_of_foreigner
                 if form_c_name.value and (not fused_record.given_names.value and not fused_record.surname.value):
                     parts = form_c_name.value.split(maxsplit=1)
                     fused_record.surname = FieldResult(value=parts[0], confidence=form_c_name.confidence, source="welcome_form")
                     if len(parts) > 1:
                         fused_record.given_names = FieldResult(value=parts[1], confidence=form_c_name.confidence, source="welcome_form")
 
-                # Fallback bio comparisons if passport/visa didn't capture them
+                # Fallback bio comparisons only if primary documents were missing
                 if not fused_record.visa_place_of_issue.value:
-                    fused_record.visa_place_of_issue = normalize_vlm_field(vlm_form.get("place_of_issue_of_visa"), source="welcome_form")
+                    fused_record.visa_place_of_issue = fused_record.documents.welcome_form.place_of_issue_of_visa
                 if not fused_record.arrival_date_india.value:
-                    fused_record.arrival_date_india = normalize_vlm_field(vlm_form.get("date_of_arrival_in_india"), source="welcome_form")
+                    fused_record.arrival_date_india = fused_record.documents.welcome_form.date_of_arrival_in_india
                 if not fused_record.nationality.value:
-                    fused_record.nationality = normalize_vlm_field(vlm_form.get("nationality"), source="welcome_form")
+                    fused_record.nationality = fused_record.documents.welcome_form.nationality
 
-                # Map extracted Row 6-12 homestay and travel movement fields
-                fused_record.arrival_datetime_homestay = normalize_vlm_field(vlm_form.get("datetime_arrival_homestay"), source="welcome_form")
-                fused_record.arrived_from = normalize_vlm_field(vlm_form.get("arrived_from"), source="welcome_form")
-                fused_record.proceeding_to = normalize_vlm_field(vlm_form.get("proceeding_to"), source="welcome_form")
-                fused_record.stay_duration_india = normalize_vlm_field(
-                    vlm_form.get("proposed_duration_stay_india") or vlm_form.get("stay_duration_india"),
-                    source="welcome_form"
-                )
-                fused_record.purpose_of_visit = normalize_vlm_field(vlm_form.get("purpose_of_visit_profession"), source="welcome_form")
-                fused_record.expected_departure_date = normalize_vlm_field(vlm_form.get("expected_date_departure"), source="welcome_form")
-                fused_record.arrived_country_city_india = normalize_vlm_field(vlm_form.get("country_city_arrived_to_india"), source="welcome_form")
+                # Homestay & travel movement fields
+                fused_record.arrival_datetime_homestay = fused_record.documents.welcome_form.arrival_datetime_homestay
+                fused_record.arrived_from = fused_record.documents.welcome_form.arrived_from
+                fused_record.proceeding_to = fused_record.documents.welcome_form.proceeding_to
+                fused_record.stay_duration_india = fused_record.documents.welcome_form.stay_duration_india
+                fused_record.purpose_of_visit = fused_record.documents.welcome_form.purpose_of_visit
+                fused_record.expected_departure_date = fused_record.documents.welcome_form.expected_departure_date
+                fused_record.arrived_country_city_india = fused_record.documents.welcome_form.arrived_country_city_india
 
                 processing_notes.append("Form-C arrival report (Rows 1-12) extracted via unified single-pass VLM.")
         else:
