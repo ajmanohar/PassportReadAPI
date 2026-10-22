@@ -9,6 +9,8 @@
 # Server-Side Document Normalization:
 # - Applies EXIF transposition to correct camera orientation tags.
 # - High-confidence OSD thresholding: Ignores low-confidence (< 2.0) or non-Latin OSD false positives.
+# - Form-C Deterministic Orientation: Checks for 'ARRIVAL REPORT' or 'FORM C' in top crop;
+#   if absent, tests 180° flip and rotates to guarantee upright Pass 4A/4B cropping.
 # - Neutral administrative archival prompts preventing safety refusal triggers.
 # - Explicit header separation: Distinguishes pre-printed homestay letterhead from guest residential address.
 # - Dynamic visual token bounding respecting per-stage patch ceilings.
@@ -125,8 +127,6 @@ def load_and_preprocess_image(
             image = image.convert("RGB")
 
         # 3. Guarded auto-orientation check for documents
-        # Only rotate if Tesseract OSD is highly confident (conf >= 2.0) and script is Latin.
-        # This prevents low-confidence false rotations (e.g. conf 0.47 classifying Latin handwriting as Japanese).
         if enable_auto_orient:
             try:
                 thumb = image.copy()
@@ -222,7 +222,6 @@ def run_vlm_inference(
         f"patches: {effective_min_pixels}-{effective_max_pixels}px)..."
     )
 
-    # Format user prompt according to Qwen2-VL chat conversation template
     messages = [
         {
             "role": "user",
@@ -238,11 +237,9 @@ def run_vlm_inference(
         }
     ]
 
-    # Process prompt template and extract visual input tensors
     text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
 
-    # Build input tensor dictionaries
     inputs = processor(
         text=[text_prompt],
         images=image_inputs,
@@ -251,14 +248,12 @@ def run_vlm_inference(
         return_tensors="pt"
     )
 
-    # Move tensors to designated execution device (CPU)
     inputs = {k: v.to(settings.device) for k, v in inputs.items()}
 
     effective_max_tokens = max_tokens_override if max_tokens_override is not None else settings.max_new_tokens
     logger.info(f"[{stage_label}] Beginning PyTorch CPU token generation (max_new_tokens={effective_max_tokens})...")
     gen_start = time.perf_counter()
 
-    # Deterministic greedy decoding (do_sample=False) to suppress probabilistic hallucinations
     with torch.no_grad():
         generated_ids = model.generate(
             **inputs,
@@ -269,13 +264,11 @@ def run_vlm_inference(
     gen_duration = time.perf_counter() - gen_start
     total_duration = time.perf_counter() - start_vlm_time
 
-    # Separate model-generated response tokens from the input prompt tokens
     generated_ids_trimmed = [
         out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
     ]
     tokens_generated = len(generated_ids_trimmed[0]) if generated_ids_trimmed else 0
 
-    # Decode tokens into UTF-8 string
     raw_text = processor.batch_decode(
         generated_ids_trimmed,
         skip_special_tokens=True,
@@ -287,7 +280,6 @@ def run_vlm_inference(
         f"({tokens_generated / max(0.01, gen_duration):.1f} tok/s). Total stage latency: {total_duration:.2f}s."
     )
 
-    # Extract JSON string payload bounded by braces with syntax cleanup fallback
     try:
         match = re.search(r"\{.*\}", raw_text, re.DOTALL)
         if match:
@@ -335,7 +327,6 @@ def normalize_vlm_field(
         val = str(raw_field)
         raw_conf = default_score
 
-    # Sanitize string through anti-hallucination filter
     clean_val = sanitize_extracted_string(val)
     if clean_val is None:
         return FieldResult(value=None, confidence=0.0, source=source)
@@ -430,7 +421,6 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
     :param job_input: Either a UUID string or a recovered dictionary holding 'job_id'.
     :param ml_state: Shared dictionary holding model handles.
     """
-    # Defensive unwrapping: Extract UUID string if a dictionary was passed from startup recovery
     if isinstance(job_input, dict):
         job_id = str(job_input.get("job_id", "")).strip()
     else:
@@ -696,6 +686,38 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
             welcome_raw = await asyncio.to_thread(load_and_preprocess_image, welcome_path)
             
             if welcome_raw:
+                # --------------------------------------------------------------
+                # Robust Header-Grounded 180° Inversion Guard for Form-C:
+                # Tests for "ARRIVAL" or "FORM C" in top 35% crop. If absent,
+                # checks a 180° flipped crop. If present, rotates 180° so the
+                # document is upright before Pass 4A and Pass 4B cropping.
+                # --------------------------------------------------------------
+                try:
+                    w_w, w_h = welcome_raw.size
+                    sample_thumb = welcome_raw.copy()
+                    sample_thumb.thumbnail((800, 800))
+                    t_w, t_h = sample_thumb.size
+
+                    test_top_crop = sample_thumb.crop((0, 0, t_w, int(t_h * 0.35)))
+                    txt_top_native = await asyncio.to_thread(pytesseract.image_to_string, test_top_crop)
+                    has_header_native = "ARRIVAL" in txt_top_native.upper() or "FORM C" in txt_top_native.upper()
+
+                    if not has_header_native:
+                        test_flipped = sample_thumb.rotate(180)
+                        test_flipped_crop = test_flipped.crop((0, 0, t_w, int(t_h * 0.35)))
+                        txt_top_flipped = await asyncio.to_thread(pytesseract.image_to_string, test_flipped_crop)
+                        has_header_flipped = "ARRIVAL" in txt_top_flipped.upper() or "FORM C" in txt_top_flipped.upper()
+
+                        if has_header_flipped:
+                            logger.info(f"[{job_id}] Form-C header detected upside down. Rotating 180° to upright orientation.")
+                            welcome_raw = welcome_raw.rotate(180, expand=True)
+                        else:
+                            logger.info(f"[{job_id}] Form-C header check inconclusive. Preserving native orientation.")
+                    else:
+                        logger.info(f"[{job_id}] Form-C header verified upright in native orientation.")
+                except Exception as orient_err:
+                    logger.warning(f"[{job_id}] Form-C header orientation test bypassed: {orient_err}")
+
                 img_w, img_h = welcome_raw.size
 
                 # ------------------------------------------------------------------
