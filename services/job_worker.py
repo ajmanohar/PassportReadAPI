@@ -9,14 +9,14 @@
 # Server-Side Document Normalization:
 # - Applies EXIF transposition to correct camera orientation tags.
 # - High-confidence OSD thresholding: Ignores low-confidence (< 2.0) or non-Latin OSD false positives.
+# - Stamp 4-Way Orientation Guard: Evaluates 0°, 90°, 180°, 270° rotations to keep passport stamps upright.
 # - Form-C Deterministic Orientation: Checks for 'ARRIVAL REPORT' or 'FORM C' in top crop;
 #   if absent, tests 180° flip and rotates to guarantee upright Pass 4A/4B cropping.
-# - Neutral administrative archival prompts preventing safety refusal triggers.
 # - Explicit header separation: Distinguishes pre-printed homestay letterhead from guest residential address.
 # - Dynamic visual token bounding respecting per-stage patch ceilings.
 # - High-definition visual patch allocation for fine cursive handwriting.
 # - OCR-Assisted Grounding: Supplies full localized Tesseract tokens as context hints to Qwen2-VL.
-# - Row-Anchored Form-C Slices: Explicitly anchors rows 1-5 (Pass 4A) and rows 6-12 (Pass 4B).
+# - Row-Anchored Form-C Slices: Anchors rows 1-5 (Pass 4A: 0-60%) and rows 6-12 (Pass 4B: 55-100%).
 # - Resilient Queue Ingestion: Safely handles both raw UUID strings and startup recovery dicts.
 # ==============================================================================
 
@@ -110,7 +110,7 @@ def parse_mrz_date(raw_mrz_date: Optional[str], is_expiry: bool = False) -> Opti
         mm = int(cleaned[2:4])
         dd = int(cleaned[4:6])
 
-        # Validate month and day boundaries
+        # Validate calendar boundaries
         if mm < 1 or mm > 12 or dd < 1 or dd > 31:
             return cleaned
 
@@ -515,7 +515,7 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                         if not clean:
                             return FieldResult(value=None, confidence=0.0, source="tesseract_mrz")
                         
-                        # Normalize 6-digit MRZ date representation (YYMMDD) to human-readable YYYY-MM-DD
+                        # Normalize 6-digit MRZ date representation (YYMMDD) to standard YYYY-MM-DD
                         if is_date:
                             clean = parse_mrz_date(clean, is_expiry=is_expiry) or clean
 
@@ -689,15 +689,49 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
             logger.info(f"[{job_id}] Stage 2/4: No visa_page document attached to job. Skipping.")
 
         # ======================================================================
-        # 3. IMMIGRATION ENTRY STAMP EXTRACTION (QWEN2-VL)
+        # 3. IMMIGRATION ENTRY STAMP EXTRACTION (QWEN2-VL + 4-WAY ROTATION GUARD)
         # ======================================================================
         doc_paths = refresh_document_paths(job_id)
         stamp_path = doc_paths.get("entry_stamp")
 
         if stamp_path and os.path.exists(stamp_path):
-            logger.info(f"[{job_id}] Stage 3/4: Running Qwen2-VL entry stamp extraction ({stamp_path})...")
+            logger.info(f"[{job_id}] Stage 3/4: Initializing Entry Stamp extraction with 4-way orientation guard ({stamp_path})...")
             stamp_image = await asyncio.to_thread(load_and_preprocess_image, stamp_path)
+            
             if stamp_image:
+                # --------------------------------------------------------------
+                # Precision 4-Way Inversion & Orientation Guard for Passport Stamps:
+                # Stamps on interior visa pages are often captured landscape (90°/270°)
+                # or inverted (180°). Test low-res thumbnails across all 4 quadrants
+                # for immigration anchors ('IMMIGRATION', 'VISAS', 'ARRIVAL', 'AIRPORT', 'SEAPORT').
+                # --------------------------------------------------------------
+                best_stamp_angle = 0
+                try:
+                    thumb_stamp = stamp_image.copy()
+                    thumb_stamp.thumbnail((800, 800), Image.Resampling.LANCZOS)
+                    
+                    found_angle = None
+                    # Test native first, then 270°, 90°, 180°
+                    for test_angle in [0, 270, 90, 180]:
+                        rotated_thumb = thumb_stamp.rotate(test_angle, expand=True) if test_angle != 0 else thumb_stamp
+                        ocr_txt = await asyncio.to_thread(pytesseract.image_to_string, rotated_thumb)
+                        ocr_upper = ocr_txt.upper()
+                        
+                        # Check for passport page or stamp keyword anchors
+                        if any(kw in ocr_upper for kw in ["IMMIGRATION", "VISAS", "SICHTVERMERKE", "ARRIVAL", "ENTRY", "AIRPORT", "SEAPORT", "INDIA"]):
+                            found_angle = test_angle
+                            logger.info(f"[{job_id}] Stamp orientation matched anchor at {test_angle}° rotation.")
+                            break
+                    
+                    if found_angle is not None and found_angle != 0:
+                        best_stamp_angle = found_angle
+                        logger.info(f"[{job_id}] Rotating stamp image by {best_stamp_angle}° to ensure upright orientation.")
+                        stamp_image = stamp_image.rotate(best_stamp_angle, expand=True)
+                    else:
+                        logger.info(f"[{job_id}] Stamp orientation check native 0° retained.")
+                except Exception as stamp_orient_err:
+                    logger.warning(f"[{job_id}] Stamp orientation detection bypassed: {stamp_orient_err}")
+
                 stamp_prompt = (
                     "You are an administrative document verification assistant inspecting an Indian immigration entry/arrival rubber stamp image.\n"
                     "Extract the arrival details into a valid JSON object matching this schema:\n"
@@ -708,6 +742,7 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     "Instructions:\n"
                     "- Read only ARRIVAL or ENTRY stamps. Ignore departure or exit stamps.\n"
                     "- Transcribe the exact port or airport name printed on the arrival stamp borders (e.g. 'COCHIN SEAPORT', 'DELHI AIRPORT', 'TRIVANDRUM INTL AIRPORT', 'MUMBAI').\n"
+                    "- For arrival_date, transcribe the date printed or stamped across the center of the arrival stamp.\n"
                     "- If cut off, smudged, or illegible, return null for value and 0.0 for confidence.\n"
                     "- If the arrival date is illegible or not present, return null for value and 0.0 for confidence.\n"
                     "- Output JSON only."
@@ -856,9 +891,9 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
 
                 # ------------------------------------------------------------------
                 # Pass 4B: Bottom Section (Rows 6 to 12: Homestay Arrival, Travel & Stay Dates)
-                # Crop bottom 55% of the document (from 0.45 * img_h to img_h)
+                # Crop lower section from 55% to 100% to cleanly focus on Rows 6 to 12
                 # ------------------------------------------------------------------
-                bottom_crop_box = (0, int(img_h * 0.45), img_w, img_h)
+                bottom_crop_box = (0, int(img_h * 0.55), img_w, img_h)
                 welcome_bottom_img = welcome_raw.crop(bottom_crop_box)
                 logger.info(f"[{job_id}] Pass 4B: Cropped bottom section ({img_w}x{welcome_bottom_img.size[1]}).")
 
@@ -877,8 +912,8 @@ async def process_single_job(job_input: Union[str, Dict[str, Any]], ml_state: di
                     f"\"\"\"\n{ocr_bottom_text}\n\"\"\"\n\n"
                     "Examine the numbered table rows on this slip:\n"
                     "- Row 6: Date and Time of Arrival in the home stay (e.g., '17/5/2026 12:00' or '09.10.16 18:00')\n"
-                    "- Row 7: Arrived from (city or state name written in row 7)\n"
-                    "- Row 8: Proceeding to (from here) (city or state name written in row 8)\n"
+                    "- Row 7: Arrived from (city or state name written in row 7, e.g., 'KERALA' or 'DELHI')\n"
+                    "- Row 8: Proceeding to (from here) (city or state name written in row 8, e.g., 'GOA' or 'GERMANY')\n"
                     "- Row 9: Proposed duration of stay in India (e.g., '2 days' or '1 month')\n"
                     "- Row 10: Purpose of visit & your Profession (e.g., 'Business', 'Tourism')\n"
                     "- Row 11: Expected date of departure (from here) (date written in row 11)\n"
