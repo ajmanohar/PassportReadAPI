@@ -292,7 +292,8 @@ async def start_job_processing(job_id: str):
 async def get_job_document_image(job_id: str, doc_type: str):
     """
     Streams the stored binary document image for desktop/mobile inspection.
-    First checks SQLite doc_paths manifest, then falls back to directory inspection.
+    First checks SQLite doc_paths manifest, then falls back to directory inspection
+    with comprehensive prefix pattern matching.
     """
     job_record = get_job(job_id)
     if not job_record:
@@ -304,18 +305,20 @@ async def get_job_document_image(job_id: str, doc_type: str):
     doc_paths = job_record.get("doc_paths", {})
     resolved_path = doc_paths.get(doc_type)
 
+    # 1. If path in database exists and is valid on disk, stream directly
     if resolved_path and os.path.exists(resolved_path):
         return FileResponse(resolved_path, media_type="image/jpeg")
 
+    # 2. Comprehensive prefix fallback search across job disk directory
     job_dir = os.path.join(BASE_STORAGE_DIR, job_id)
     if os.path.exists(job_dir):
         prefix_mapping = {
-            "passport_bio": ["bio_", "passport_"],
-            "visa_document": ["visadoc_"],
-            "visa_stamp": ["visastamp_"],
-            "visa_page": ["visa_", "visadoc_", "visastamp_"],
-            "entry_stamp": ["stamp_"],
-            "welcome_form": ["form_", "welcome_"],
+            "passport_bio": ["bio_", "passport_bio_", "passport_"],
+            "visa_document": ["visadoc_", "visa_document_"],
+            "visa_stamp": ["visastamp_", "visa_stamp_", "visa_page_"],
+            "visa_page": ["visa_", "visadoc_", "visastamp_", "visa_stamp_"],
+            "entry_stamp": ["entry_stamp_", "stamp_"],
+            "welcome_form": ["welcome_form_", "form_", "welcome_"],
             "guest_photo": ["guest_photo_", "photo_"]
         }
         prefixes = prefix_mapping.get(doc_type, [f"{doc_type}_"])
